@@ -10,7 +10,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
-from lake.engine.model_executor.layers.attentions import AttentionMetadata, build_attn_metadata
+from lake.engine.model_executor.layers.attentions import (
+    AttentionMetadata,
+    build_attn_backend,
+    build_attn_metadata,
+)
 from lake.engine.input_batch import InputBatch, InputBuffers
 from lake.engine.model_executor.models.registry import load_registered_model
 from lake.engine.pool_iface import PoolIface
@@ -55,6 +59,7 @@ class ModelRunner:
         pool: PoolIface,
         *,
         model_backend: str = "qwen3",
+        attn_backend_name: str = "cpu",
         model_config: Optional[Any] = None,
         weight_pin_callback: Optional[Callable[[ModelLoadInfo], None]] = None,
     ) -> None:
@@ -63,6 +68,10 @@ class ModelRunner:
         self._input_buffers = InputBuffers(max_num_reqs=64, max_num_tokens=8192)
         self._attn_meta: Optional[AttentionMetadata] = None
         self.model_backend = model_backend
+        # attention 后端实例：runner 经注册表 ``build_attn_backend`` 建一次，沿模型树
+        # 构造期注入到每个 ``Qwen3PagedAttention``——模型层不 import 任何具体后端
+        # （对齐 vLLM ``Attention``/SGLang ``RadixAttention``：后端由 runner 选定注入）。
+        self._attn_backend = build_attn_backend(attn_backend_name)
         self._config_override = model_config
         self._model: Optional[Any] = None
         self._weight_pin_callback = weight_pin_callback
@@ -138,6 +147,7 @@ class ModelRunner:
             revision=revision,
             load_format=load_format,
             config_override=self._config_override,
+            attn_backend=self._attn_backend,
         )
         self._model = loaded.model
         self._model_path = loaded.model_path

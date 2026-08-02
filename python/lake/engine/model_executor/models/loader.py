@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Iterable
 from typing import Generic, Literal, TypeVar
 
@@ -17,8 +18,20 @@ LoadFormat = Literal["dummy", "hf"]
 class BaseModelLoader(Generic[TModel, TConfig]):
     """Base loader: create model first, then delegate weight loading."""
 
-    def load_model(self, model_cls: type[TModel], config: TConfig) -> TModel:
-        model = model_cls(config)
+    def load_model(
+        self,
+        model_cls: type[TModel],
+        config: TConfig,
+        *,
+        attn_backend: object | None = None,
+    ) -> TModel:
+        # 仅当模型类接受 ``attn_backend`` 时注入（Qwen3ForCausalLM 接受；测试/自定义
+        # 模型可能不接受，回退到 ``model_cls(config)``）——对齐 vLLM 对可选构造 kwarg
+        # 的兼容处理，避免强制所有模型类改签名。
+        if "attn_backend" in inspect.signature(model_cls).parameters:
+            model = model_cls(config, attn_backend=attn_backend)
+        else:
+            model = model_cls(config)
         loaded = self.load_weights(model)
         if loaded is not None:
             setattr(model, "loaded_weights", loaded)

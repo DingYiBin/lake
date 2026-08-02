@@ -226,6 +226,7 @@ lake 的 `compute-layer.md` D1 节 `ForwardMode.MIXED` 的定义（"同批两种
 | GPU kernel 是否借 flash-attn | 优先上游 `flash-attn` 包（FA2 varlen 已带 `block_table`）；上游若不支持小 `block_size`（`with_kvcache` 要求 256 倍数）或入图 `out=`，再回退 `vllm-project/flash-attention` fork | 上游 `flash_attn_varlen_func` 签名带 `block_table`；fork 优势在小 block_size + `out=` + `seqused_k` |
 | metadata 形态 | 保持 vLLM 形态（独立 `AttentionMetadata` + `build_attn_metadata`），不学 SGLang 把 metadata 并进 ForwardBatch | lake `AttentionMetadata` 字段已与 `CommonAttentionMetadata` 镜像、与 varlen kernel 入参对齐 |
 | model runner 形态 | 保持 SGLang 形态（单一 `ModelRunner` + `model_backend` 字段 + 注册表），**不**按平台子类化 | vLLM V2 时代 CPU runner 缩到 17 行，正在向单类收敛 |
+| 后端注入（送达层） | **构造期注入**：runner 经 `build_attn_backend(name)` 建实例，沿模型树构造期传到 `Qwen3PagedAttention.backend`；模型层不 import 任何具体后端 | vLLM 每层 `Attention.__init__` 调 `get_impl_cls()` 实例化自己的 impl + metadata/kv_cache 经 forward context；SGLang runner 持单实例、层经 `get_attn_backend()` 取（forward context）。lake 取折中：runner 持单实例（SGLang 式，后端无状态）+ 构造期注入（vLLM 式，免 forward context 改造） |
 | MIXED 处理 | 不单独 `forward_mixed`——调度侧把 decode 标成 extend_len=1，runner 侧 varlen 自然吃 | SGLang CUDA 后端 MIXED 走 `forward_extend`，varlen 天然支持同批不同 q_len |
 | 混部 vs PD 分离并行度 | 混部共享进程级并行度；prefill/decode 差异化并行**必须走 PD 分离**（Router 选路），不能在混部里做 | 并行度是进程级配置，MIXED 同 forward 同 communicator |
 

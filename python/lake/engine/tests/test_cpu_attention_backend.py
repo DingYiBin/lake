@@ -43,11 +43,48 @@ def test_qwen3_paged_attention_uses_cpu_backend_for_tensors() -> None:
     q = torch.randn(1, 2, 3, 4)
     k = torch.randn(1, 1, 3, 4)
     v = torch.randn(1, 1, 3, 4)
-    attn = Qwen3PagedAttention(num_heads=2, head_dim=4, num_kv_heads=1)
+    attn = Qwen3PagedAttention(
+        num_heads=2, head_dim=4, num_kv_heads=1, backend=CpuAttentionBackend()
+    )
 
     out = attn(q, k, v)
     expected = CpuAttentionBackend().forward_tensors(q, k, v, scale=4**-0.5)
     torch.testing.assert_close(out, expected)
+
+
+def test_qwen3_paged_attention_dispatches_varlen() -> None:
+    """``Qwen3PagedAttention(q,k_cache,v_cache,attn_meta=...)`` 走 forward_varlen 分派。
+
+    混合批：req0 extend（prefill，q_len=seq_len=5）；req1 decode（q_len=1，seq_len=4）。
+    对照 ``_manual_padded_causal`` 参照，验证经模型层分派后仍与 CPU 后端直连等价。
+    """
+    torch.manual_seed(4)
+    H, Hkv, D = 2, 1, 6
+    scale = D**-0.5
+    seq_lens = [5, 4]
+    q_lens = [5, 1]
+    q_per_req = [torch.randn(ql, H, D) for ql in q_lens]
+    k_per_req = [torch.randn(s, Hkv, D) for s in seq_lens]
+    v_per_req = [torch.randn(s, Hkv, D) for s in seq_lens]
+    k_cache, tables = _build_paged_kv(k_per_req, block_size=8)
+    v_cache, _ = _build_paged_kv(v_per_req, block_size=8)
+    q = torch.cat(q_per_req, dim=0)
+    meta = _meta(seq_lens, q_lens, tables)
+
+    attn = Qwen3PagedAttention(
+        num_heads=H, head_dim=D, num_kv_heads=Hkv, backend=CpuAttentionBackend(), block_size=8
+    )
+    out = attn(q, k_cache, v_cache, attn_meta=meta)
+
+    expected = torch.cat(
+        [_manual_padded_causal(q_per_req[i], k_per_req[i], v_per_req[i], seq_lens[i], scale=scale)
+         for i in range(len(seq_lens))],
+        dim=0,
+    )
+    torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+
+    direct = CpuAttentionBackend().forward_varlen(q, k_cache, v_cache, meta, block_size=8, scale=scale)
+    torch.testing.assert_close(out, direct, rtol=1e-6, atol=1e-6)
 
 
 def _manual_varlen_causal(

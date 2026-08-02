@@ -8,12 +8,17 @@ deterministic forward 占位，不加载真实 safetensors。
 from __future__ import annotations
 
 from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
 from transformers import Qwen3Config
 
-from lake.engine.model_executor.layers.attentions import CpuAttentionBackend
+if TYPE_CHECKING:
+    from lake.engine.model_executor.layers.attentions import (
+        AttentionBackend,
+        AttentionMetadata,
+    )
 
 
 def _param_dtype(config: Qwen3Config) -> torch.dtype:
@@ -57,35 +62,67 @@ class Qwen3RotaryEmbedding(nn.Module):
 
 
 class Qwen3PagedAttention(nn.Module):
-    """Paged-attention placeholder with the same ownership boundary as vLLM."""
+    """Paged-attention 层，对齐 vLLM ``Attention`` 的所有权边界。
 
-    def __init__(self, num_heads: int, head_dim: int, num_kv_heads: int) -> None:
+    分派两条路径：
+    - **varlen / paged**（``attn_meta`` 非空）：``q [num_tokens,H,D]``，``k``/``v`` 为池
+      L0 arena 句柄 ``[total_slots,Hkv,D]``（引擎只读，新 token 的 KV 已由池/runner
+      按 ``slot_mapping`` 写入）。调 ``backend.forward_varlen``。
+    - **tensors**（``attn_meta`` 为空，dev/dummy/单测）：``q``/``k``/``v`` 为
+      ``[B,H,T,D]`` 原始张量。调 ``backend.forward_tensors``。
+
+    后端与 ``block_size`` 由构造期注入（runner 经 ``build_attn_backend(name)`` 建实例
+    后沿模型树下传；CPU/dev 默认 ``CpuAttentionBackend``，GPU 传 ``FlashAttn2Backend``），
+    本层不 import 任何具体后端——对齐 vLLM ``Attention`` / SGLang ``RadixAttention``：
+    模型层只持注入的 backend 句柄，不在 forward 内做平台判定、不 import 具体类。
+    """
+
+    def __init__(
+        self,
+        num_heads: int,
+        head_dim: int,
+        num_kv_heads: int,
+        *,
+        backend: AttentionBackend | None = None,
+        block_size: int = 8,
+    ) -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads
-        self.backend = CpuAttentionBackend()
+        self.scaling = head_dim**-0.5
+        self.block_size = block_size
+        self.backend = backend
 
-    def forward(self, q: object, k: object, v: object) -> object:
-        if (
-            isinstance(q, torch.Tensor)
-            and isinstance(k, torch.Tensor)
-            and isinstance(v, torch.Tensor)
-        ):
-            return self.backend.forward_tensors(
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        attn_meta: AttentionMetadata | None = None,
+    ) -> torch.Tensor:
+        if self.backend is None:
+            raise RuntimeError(
+                "Qwen3PagedAttention.backend is None — runner 未注入 attention 后端"
+                "（dummy 模型 forward 不应触达本层；真实 forward 需经 ModelRunner 注入）"
+            )
+        if attn_meta is not None:
+            return self.backend.forward_varlen(
                 q,
                 k,
                 v,
-                is_causal=True,
-                scale=self.head_dim**-0.5,
+                attn_meta,
+                block_size=self.block_size,
+                scale=self.scaling,
             )
-        return q
+        return self.backend.forward_tensors(q, k, v, is_causal=True, scale=self.scaling)
 
 
 class Qwen3Attention(nn.Module):
     """Qwen3 attention shell following vLLM's packed qkv projection layout."""
 
-    def __init__(self, config: Qwen3Config, layer_idx: int) -> None:
+    def __init__(self, config: Qwen3Config, layer_idx: int, *, attn_backend: AttentionBackend | None = None) -> None:
         super().__init__()
         dtype = _param_dtype(config)
         self.config = config
@@ -116,6 +153,7 @@ class Qwen3Attention(nn.Module):
             num_heads=self.total_num_heads,
             head_dim=self.head_dim,
             num_kv_heads=self.total_num_kv_heads,
+            backend=attn_backend,
         )
         self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
         self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
@@ -157,7 +195,7 @@ class Qwen3Model(nn.Module):
     lake 先钉住 module 边界和 config，真 attention/MLP 后续接 Torch/Triton。
     """
 
-    def __init__(self, config: Qwen3Config) -> None:
+    def __init__(self, config: Qwen3Config, *, attn_backend: AttentionBackend | None = None) -> None:
         super().__init__()
         dtype = _param_dtype(config)
         self.config = config
@@ -171,7 +209,8 @@ class Qwen3Model(nn.Module):
             dtype=dtype,
         )
         self.layers = nn.ModuleList(
-            Qwen3DecoderLayer(config, layer_idx=i) for i in range(config.num_hidden_layers)
+            Qwen3DecoderLayer(config, layer_idx=i, attn_backend=attn_backend)
+            for i in range(config.num_hidden_layers)
         )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
         self.rotary_emb = Qwen3RotaryEmbedding(config)
@@ -196,13 +235,13 @@ class Qwen3Model(nn.Module):
 class Qwen3DecoderLayer(nn.Module):
     """Dense Qwen3 decoder layer placeholder with stable module identity."""
 
-    def __init__(self, config: Qwen3Config, layer_idx: int) -> None:
+    def __init__(self, config: Qwen3Config, layer_idx: int, *, attn_backend: AttentionBackend | None = None) -> None:
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
         dtype = _param_dtype(config)
         self.hidden_size = config.hidden_size
-        self.self_attn = Qwen3Attention(config, layer_idx)
+        self.self_attn = Qwen3Attention(config, layer_idx, attn_backend=attn_backend)
         self.mlp = Qwen3MLP(config)
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
         self.post_attention_layernorm = Qwen3RMSNorm(
@@ -223,10 +262,10 @@ class Qwen3ForCausalLM(nn.Module):
     `load_weights(weights)`；dummy 由 loader 层处理。
     """
 
-    def __init__(self, config: Qwen3Config) -> None:
+    def __init__(self, config: Qwen3Config, *, attn_backend: AttentionBackend | None = None) -> None:
         super().__init__()
         self.config = config
-        self.model = Qwen3Model(config)
+        self.model = Qwen3Model(config, attn_backend=attn_backend)
         self.lm_head = (
             self.model.embed_tokens
             if config.tie_word_embeddings

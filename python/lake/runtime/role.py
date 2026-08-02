@@ -45,6 +45,9 @@ class RoleConfig:
     allow_partial_hit: bool = False  # False=缺块整批失败（all-or-nothing）
     # qwen3=Qwen3 load/forward 骨架；mock 仅测试用
     model_backend: str = "qwen3"  # qwen3 | mock
+    # attention 后端名：cpu（dev/test，纯 torch SDPA）| fa2（GPU，上游 flash-attn）
+    # | triton/ref（早期原型）。runner 经 build_attn_backend(name) 建实例注入模型树。
+    attn_backend_name: str = "cpu"
     # C12：模型加载 / warmup 骨架。model_path 是加载源，不作为 API 名称暴露。
     model_path: str = ""
     served_model_name: str = "model"
@@ -87,9 +90,12 @@ class RoleConfig:
             role = WorkerRole.HYBRID
         backend = os.environ.get("LAKE_MODEL_BACKEND", "qwen3").strip().lower()
         backend = backend or "qwen3"
+        attn_backend = os.environ.get("LAKE_ATTN_BACKEND", "cpu").strip().lower()
+        attn_backend = attn_backend or "cpu"
         return cls(
             role=role,
             model_backend=backend,
+            attn_backend_name=attn_backend,
             model_path=os.environ.get("LAKE_MODEL_PATH", "").strip(),
             served_model_name=os.environ.get("LAKE_SERVED_MODEL_NAME", "model").strip()
             or "model",
