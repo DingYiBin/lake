@@ -1,4 +1,4 @@
-"""Pure Torch attention backend tests."""
+"""Cpu attention backend tests."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import torch
 
 from lake.engine.model_executor.layers.attentions import (
     AttentionMetadata,
-    TorchAttentionBackend,
+    CpuAttentionBackend,
 )
 from lake.engine.model_executor.models.qwen.qwen3 import Qwen3PagedAttention
 
@@ -26,7 +26,7 @@ def _manual_causal_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) 
     return torch.matmul(probs, v)
 
 
-def test_torch_attention_backend_matches_manual_causal_gqa() -> None:
+def test_cpu_attention_backend_matches_manual_causal_gqa() -> None:
     q = torch.tensor(
         [[[[1.0, 0.0], [0.0, 1.0]], [[1.0, 1.0], [1.0, -1.0]]]],
         dtype=torch.float32,
@@ -34,19 +34,19 @@ def test_torch_attention_backend_matches_manual_causal_gqa() -> None:
     k = torch.tensor([[[[1.0, 0.0], [0.0, 1.0]]]], dtype=torch.float32)
     v = torch.tensor([[[[2.0, 0.0], [0.0, 4.0]]]], dtype=torch.float32)
 
-    out = TorchAttentionBackend().forward_tensors(q, k, v)
+    out = CpuAttentionBackend().forward_tensors(q, k, v)
     expected = _manual_causal_attention(q, k, v)
     torch.testing.assert_close(out, expected)
 
 
-def test_qwen3_paged_attention_uses_torch_backend_for_tensors() -> None:
+def test_qwen3_paged_attention_uses_cpu_backend_for_tensors() -> None:
     q = torch.randn(1, 2, 3, 4)
     k = torch.randn(1, 1, 3, 4)
     v = torch.randn(1, 1, 3, 4)
     attn = Qwen3PagedAttention(num_heads=2, head_dim=4, num_kv_heads=1)
 
     out = attn(q, k, v)
-    expected = TorchAttentionBackend().forward_tensors(q, k, v, scale=4**-0.5)
+    expected = CpuAttentionBackend().forward_tensors(q, k, v, scale=4**-0.5)
     torch.testing.assert_close(out, expected)
 
 
@@ -155,7 +155,7 @@ def test_forward_varlen_extend_matches_causal() -> None:
     q = torch.cat(q_per_req, dim=0)
     meta = _meta(seq_lens, seq_lens, tables)
 
-    out = TorchAttentionBackend().forward_varlen(q, k_cache, v_cache, meta, scale=scale)
+    out = CpuAttentionBackend().forward_varlen(q, k_cache, v_cache, meta, scale=scale)
 
     expected = torch.cat(
         [_manual_varlen_causal(q_per_req[i], k_per_req[i], v_per_req[i], scale=scale)
@@ -179,7 +179,7 @@ def test_forward_varlen_decode_matches_full_visible() -> None:
     q = torch.cat(q_per_req, dim=0)
     meta = _meta(seq_lens, [1, 1], tables)
 
-    out = TorchAttentionBackend().forward_varlen(q, k_cache, v_cache, meta, scale=scale)
+    out = CpuAttentionBackend().forward_varlen(q, k_cache, v_cache, meta, scale=scale)
 
     expected = torch.cat(
         [_manual_padded_causal(q_per_req[i], k_per_req[i], v_per_req[i], seq_lens[i], scale=scale)
@@ -204,7 +204,7 @@ def test_forward_varlen_mixed_batch() -> None:
     q = torch.cat(q_per_req, dim=0)
     meta = _meta(seq_lens, q_lens, tables)
 
-    out = TorchAttentionBackend().forward_varlen(q, k_cache, v_cache, meta, scale=scale)
+    out = CpuAttentionBackend().forward_varlen(q, k_cache, v_cache, meta, scale=scale)
 
     expected = torch.cat(
         [_manual_padded_causal(q_per_req[i], k_per_req[i], v_per_req[i], seq_lens[i], scale=scale)
@@ -229,7 +229,7 @@ def test_forward_varlen_chunked_extend() -> None:
     q = q_per_req[0]
     meta = _meta(seq_lens, q_lens, tables)
 
-    out = TorchAttentionBackend().forward_varlen(q, k_cache, v_cache, meta, scale=scale)
+    out = CpuAttentionBackend().forward_varlen(q, k_cache, v_cache, meta, scale=scale)
 
     # 参照：新 query 段对全 KV 因果（query 位置 = 4,5,6）
     full_q = torch.zeros(7, H, D, dtype=q.dtype)

@@ -13,7 +13,7 @@ import torch
 from torch import nn
 from transformers import Qwen3Config
 
-from lake.engine.model_executor.layers.attentions import TorchAttentionBackend
+from lake.engine.model_executor.layers.attentions import CpuAttentionBackend
 
 
 def _param_dtype(config: Qwen3Config) -> torch.dtype:
@@ -64,7 +64,7 @@ class Qwen3PagedAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.num_kv_heads = num_kv_heads
-        self.backend = TorchAttentionBackend()
+        self.backend = CpuAttentionBackend()
 
     def forward(self, q: object, k: object, v: object) -> object:
         if (

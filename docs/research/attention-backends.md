@@ -99,7 +99,7 @@ sdpa_start_loc: torch.Tensor | None = None
 
 ### 对 lake 的启示（方案 A 验证）
 
-SGLang `torch_native` 正是 lake `TorchAttentionBackend` 应走的**方案 A**（per-request 循环 + gather paged + SDPA），且是**活路径**。vLLM 的 SDPA 路径死了不代表方案 A 不可行——vLLM 死掉是因为它要追求 x86 CPU 生产性能（改写 C++ AMX），不是方案 A 本身有问题。lake 的 CPU 是 dev/test 路径，不是生产，方案 A 完全合理。
+SGLang `torch_native` 正是 lake `CpuAttentionBackend` 应走的**方案 A**（per-request 循环 + gather paged + SDPA），且是**活路径**。vLLM 的 SDPA 路径死了不代表方案 A 不可行——vLLM 死掉是因为它要追求 x86 CPU 生产性能（改写 C++ AMX），不是方案 A 本身有问题。lake 的 CPU 是 dev/test 路径，不是生产，方案 A 完全合理。
 
 **方案 A 步骤**（对齐 SGLang `torch_native`）：
 1. 按 `query_start_loc` 切请求
@@ -179,7 +179,7 @@ NPU 例外是因为 Ascend 的 attention kernel 对 q_len=1 和 q_len>1 走不�
 lake 的 `ForwardMode` 已定义 `MIXED`（`compute-layer.md` D1 节），`SchedulerOutput.forward_mode` 会标 MIXED。SGLang 的做法给出两条路：
 
 1. **如果 lake 的 attention backend 用 varlen kernel（Triton/flash-attn fork）**：MIXED 不需要单独 `forward_mixed`——调度侧把 decode 请求的 `num_scheduled_tokens` 设为 1、`query_start/query_end` 设成最后 1 个 token，runner 侧 `forward_extend` 的 varlen 路径自然处理。这与 lake 的 `prepare_inputs`（`model_runner.py:182`）现有逻辑一致——它已按 `num_scheduled_tokens` 切 query 区间，decode 是 n=1 的特例。
-2. **如果 lake 的 `TorchAttentionBackend`（纯 torch SDPA）**：per-request 循环（方案 A）也天然支持 MIXED——每请求独立调 SDPA，q_len=1 的走 decode 形态（不 pad）、q_len>1 的走 extend 形态（pad 到 seq_len）。和 SGLang `torch_native` 的 `forward_extend` 处理 MIXED 同款。
+2. **如果 lake 的 `CpuAttentionBackend`（纯 torch SDPA）**：per-request 循环（方案 A）也天然支持 MIXED——每请求独立调 SDPA，q_len=1 的走 decode 形态（不 pad）、q_len>1 的走 extend 形态（pad 到 seq_len）。和 SGLang `torch_native` 的 `forward_extend` 处理 MIXED 同款。
 
 **结论**：lake 走 varlen 路径（Triton 或纯 torch 方案 A）后，MIXED 是"调度侧把 decode 标成 extend_len=1 + runner 侧 varlen 自然吃"的结果，不需要单独的 `forward_mixed`。这与 lake 现有的 `prepare_inputs`（按 `num_scheduled_tokens` 切 query）已经对齐，落地时只需确认 `forward_mode=MIXED` 时 runner 不走特殊分支即可。
 
@@ -221,9 +221,9 @@ lake 的 `compute-layer.md` D1 节 `ForwardMode.MIXED` 的定义（"同批两种
 
 | 议题 | 决策 | 依据 |
 |---|---|---|
-| attention backend 路线 | GPU 生产走 Triton（`TritonAttentionBackend` 落 paged varlen kernel）；CPU/dev/test 走纯 torch SDPA 方案 A（`TorchAttentionBackend.forward_varlen`，per-request 循环 + gather paged + SDPA） | SGLang `torch_native` 验证方案 A 可持续；vLLM CPU 改 C++ 是为 x86 生产，lake CPU 非 生产 |
+| attention backend 路线 | GPU 生产走 FA2 paged varlen（`FlashAttn2Backend`，上游 `flash-attn` 包，非入图）；CPU/dev/test 走纯 torch SDPA 方案 A（`CpuAttentionBackend.forward_varlen`，per-request 循环 + gather paged + SDPA） | SGLang `torch_native` 验证方案 A 可持续；vLLM CPU 改 C++ 是为 x86 生产，lake CPU 非生产 |
 | 是否装 vllm | **不装**——vllm 是单体 serving 系统非 library，import 副作用重、要编译 C++、与 lake Q1/Q2 架构冲突 | `fa_utils.py` 显示 vLLM CUDA 用自家 fork，CPU 用独立 C++ kernel，无纯 torch 路径可借 |
-| GPU kernel 是否借 flash-attn | 生产可独立构建 `vllm-project/flash-attention` fork（带 `block_table` 签名），**不**装 stock `flash-attn`（不接 `block_table`，做不了 paged） | `vllm_flash_attn.cmake` 显示 fork 独立可构建；stock 签名见 `fa_utils.py` |
+| GPU kernel 是否借 flash-attn | 优先上游 `flash-attn` 包（FA2 varlen 已带 `block_table`）；上游若不支持小 `block_size`（`with_kvcache` 要求 256 倍数）或入图 `out=`，再回退 `vllm-project/flash-attention` fork | 上游 `flash_attn_varlen_func` 签名带 `block_table`；fork 优势在小 block_size + `out=` + `seqused_k` |
 | metadata 形态 | 保持 vLLM 形态（独立 `AttentionMetadata` + `build_attn_metadata`），不学 SGLang 把 metadata 并进 ForwardBatch | lake `AttentionMetadata` 字段已与 `CommonAttentionMetadata` 镜像、与 varlen kernel 入参对齐 |
 | model runner 形态 | 保持 SGLang 形态（单一 `ModelRunner` + `model_backend` 字段 + 注册表），**不**按平台子类化 | vLLM V2 时代 CPU runner 缩到 17 行，正在向单类收敛 |
 | MIXED 处理 | 不单独 `forward_mixed`——调度侧把 decode 标成 extend_len=1，runner 侧 varlen 自然吃 | SGLang CUDA 后端 MIXED 走 `forward_extend`，varlen 天然支持同批不同 q_len |

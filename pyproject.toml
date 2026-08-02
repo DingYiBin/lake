@@ -8,16 +8,26 @@ version = "0.0.0"
 requires-python = ">=3.12"
 # 版本下限对齐生成 stub:lake_pb2.py 校验 protobuf runtime ≥ 7.35.0(major 7),
 # lake_pb2_grpc.py 校验 grpcio ≥ 1.82.1。低于此 import 即炸,故钉到生成版本。
+# torch / numpy 钉版对齐 vLLM 栈(torch==2.11.0 见 3rdparty/vllm/pyproject.toml +
+# requirements/cuda.txt;numpy==2.2.6 见 3rdparty/vllm/requirements/test/{cuda,cpu}.txt),
+# 便于后续借 vLLM fork / 算子模块时 ABI 一致。
 dependencies = [
     "grpcio>=1.82.1",
-    "numpy",
+    "numpy==2.2.6",
     "protobuf>=7.35.0",
-    "torch",
+    "torch==2.11.0",
     "transformers",
 ]
 
 # 已定技术选型 Python+Torch+Triton；torch 是计算层基础依赖，triton 随 CUDA 开发路径安装。
 [project.optional-dependencies]
+# triton 在 PyPI 有预编译 wheel,解析快,留在 uv 管理的 cuda extra。
+# flash-attn 不在此处:PyPI 仅 sdist(无 wheel),uv 会为生成 uv.lock 而**解析所有
+# extras**(见 https://github.com/astral-sh/uv/issues/6729),sdist 解析要跑 setup.py
+# 取 metadata(flash-attn 的 setup.py 做 CUDA 检测,很慢),会拖慢 plain `uv sync`。
+# 故 flash-attn 放 `requirements-cuda.txt`,GPU 环境用 `uv pip install -r` 单独装
+# (或手动装 GitHub release 预编译 wheel 规避编译)。FlashAttn2Backend 用其
+# `flash_attn_varlen_func`(FA2 paged varlen,block_table 自 2.x 支持)。
 cuda = ["triton"]
 dev = [
     "grpcio-tools==1.82.1",

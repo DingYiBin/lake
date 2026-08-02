@@ -1,0 +1,18 @@
+# GPU/CUDA 环境额外依赖（不走 uv lock，单独装）。
+#
+# 为什么不放 pyproject 的 cuda extra:
+# uv 生成 uv.lock 时会**解析所有 extras**(见 https://github.com/astral-sh/uv/issues/6729)。
+# flash-attn 在 PyPI 仅有 sdist(无预编译 wheel),解析 sdist 要跑 setup.py 取 metadata,
+# flash-attn 的 setup.py 做 CUDA 检测,很慢——会拖慢 plain `uv sync`(即便不装该 extra)。
+# 故单独放此文件,GPU 环境用 `uv pip install -r requirements-cuda.txt` 安装。
+#
+# 安装方式（二选一）:
+#   1. 从 PyPI sdist 编译(需 CUDA toolkit + nvcc,构建慢):
+#        uv pip install -r requirements-cuda.txt
+#   2. 装预编译 wheel 规避编译(从 https://github.com/Dao-AILab/flash-attention/releases
+#      选对应 torch+CUDA+平台的 wheel):
+#        uv pip install <wheel-url>
+#
+# FlashAttn2Backend 用 flash_attn_varlen_func(FA2 paged varlen,block_table 自 2.x 支持)。
+# 版本下限 2.8 取 FA2 paged varlen 成熟支持。
+flash-attn>=2.8

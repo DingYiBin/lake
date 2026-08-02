@@ -6,8 +6,9 @@ from lake.engine.model_executor.layers.attentions.attention_metadata import (
 __all__ = [
     "AttentionBackend",
     "AttentionMetadata",
+    "CpuAttentionBackend",
+    "FlashAttn2Backend",
     "RefAttentionBackend",
-    "TorchAttentionBackend",
     "build_attn_backend",
     "build_attn_metadata",
 ]
@@ -16,8 +17,9 @@ __all__ = [
 def __getattr__(name: str):
     if name in {
         "AttentionBackend",
+        "CpuAttentionBackend",
+        "FlashAttn2Backend",
         "RefAttentionBackend",
-        "TorchAttentionBackend",
         "build_attn_backend",
     }:
         from lake.engine.model_executor.layers.attentions import attention

@@ -2,7 +2,7 @@
 
 `3rdparty/llama.cpp`（[ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)，浅克隆 `--depth 1`，HEAD `7a2db1a`）。
 
-引入目的：lake 计划在 **CPU 上也做正确性验证**，需要一份"生产级 CPU attention"的参照来对照 lake 的纯 torch SDPA 路径（`TorchAttentionBackend.forward_varlen`，方案 A）。llama.cpp 是最成熟的 CPU 推理引擎，其 attention 是 ggml 库里手写的 C 实现，正好回答"CPU 上有没有 FA2 等价物"。
+引入目的：lake 计划在 **CPU 上也做正确性验证**，需要一份"生产级 CPU attention"的参照来对照 lake 的纯 torch SDPA 路径（`CpuAttentionBackend.forward_varlen`，方案 A）。llama.cpp 是最成熟的 CPU 推理引擎，其 attention 是 ggml 库里手写的 C 实现，正好回答"CPU 上有没有 FA2 等价物"。
 
 > 本项**只作 CPU attention 算子设计参考**，不作存储/调度参考（llama.cpp 是单进程引擎，无存算分离、无分布式池）。lake 的存储/调度参考见其他 submodule。
 
@@ -59,7 +59,7 @@ CPU 后端实现在 `ggml/src/ggml-cpu/ops.cpp`，分两条路径，由 `ggml_co
 | llama.cpp | lake 对应 | 说明 |
 |---|---|---|
 | **split-KV（decode）** | （未来 CPU 性能路径参考） | decode 单 token 用 split-KV 吃满多核；lake 当前 CPU 是验证路径，不做，但若将来要生产 CPU 性能可照此 |
-| **tiled prefill（不物化 softmax）** | `TorchAttentionBackend.forward_varlen`（方案 A，torch SDPA） | 同一定位：避免物化完整 attention 矩阵。lake 走 torch SDPA（math 后端）即可，不必自己写 tiling |
+| **tiled prefill（不物化 softmax）** | `CpuAttentionBackend.forward_varlen`（方案 A，torch SDPA） | 同一定位：避免物化完整 attention 矩阵。lake 走 torch SDPA（math 后端）即可，不必自己写 tiling |
 | **`use_ref` 参考实现** | lake `forward_varlen` 即"参考实现" | llama.cpp 留一条无优化参考路径用于校验；lake 的纯 torch SDPA 路径正是同款"校验参照" |
 | **op 不管理 KV cache 生命周期** | lake KV cache 归存储池 | 一致：attention op 只读 KV cache 张量句柄，不拥有。llama.cpp 调用方接 KV cache 进 graph，lake 由池 L0 arena 提供句柄 |
 
@@ -67,12 +67,12 @@ CPU 后端实现在 `ggml/src/ggml-cpu/ops.cpp`，分两条路径，由 `ggml_co
 
 - **llama.cpp 是单进程引擎**：无存算分离、无分布式 KV 池、无 PD 分离/混部/D-direct。lake 的核心架构（存储池统一管 L0-L3、Router 逐请求选路）在 llama.cpp 里完全没有对应物。本项**只参考 CPU attention 算子**这一层。
 - **ggml 是 C 库内嵌实现，非可组合算子库**：`ggml_flash_attn_ext` 绑在 ggml 计算图里，不是 pip 可装的独立 attention 算子包。lake 不能"装 llama.cpp 当 CPU 后端"——要包它得写 C 扩展 + Python binding，重，且只为 CPU 验证不值。
-- **lake CPU 定位是 dev/test 验证**，非生产。llama.cpp 的 SIMD-tiled flash-attn 是**生产 CPU 性能**方案；lake CPU 验证用 `TorchAttentionBackend.forward_varlen`（纯 torch SDPA）即可拿到正确结果，不需要 llama.cpp 的性能优化。
+- **lake CPU 定位是 dev/test 验证**，非生产。llama.cpp 的 SIMD-tiled flash-attn 是**生产 CPU 性能**方案；lake CPU 验证用 `CpuAttentionBackend.forward_varlen`（纯 torch SDPA）即可拿到正确结果，不需要 llama.cpp 的性能优化。
 
 ### 结论
 
 - **CPU 上没有 FA2 等价的可 pip 安装算子包**。llama.cpp 的 `ggml_flash_attn_ext` 是"CPU 上的 flash-like 实现"，但它是 ggml C 库内嵌、和引擎绑死，不是独立算子库。
-- **lake 的 CPU 验证路径已就绪**：`TorchAttentionBackend.forward_varlen`（纯 torch SDPA，方案 A）在 CPU 上跑通，和 SGLang `torch_native` 同款，是 CPU 上的合理"参照实现"。
+- **lake 的 CPU 验证路径已就绪**：`CpuAttentionBackend.forward_varlen`（纯 torch SDPA，方案 A）在 CPU 上跑通，和 SGLang `torch_native` 同款，是 CPU 上的合理"参照实现"。
 - **若将来 lake 要做生产 CPU 推理**（当前不在路线图），再参考 llama.cpp `ggml_flash_attn_ext` 的 split-KV / tiled / SIMD 分派设计。当前阶段不实现。
 
 ## 代码索引
