@@ -33,7 +33,7 @@ message BlockMeta { KVBlockID id; BlockKind block_kind; repeated Location locati
 
 **block_hash 必须前缀链式**(含 parent_block_hash),而非仅本块 token 内容哈希。原因:KV 是**前缀相关**的——同样的 token 序列在不同绝对位置,KV 不同(RoPE/ALiBi 位置编码、Mamba recurrent state 都是全前缀的函数)。纯内容哈希会让两条不同前缀、相同尾部内容撞到同一 block → 错误复用。链式哈希把父块哈希编进本块哈希,使 block 身份天然绑定其前缀路径:两条前缀不同 → 父哈希不同 → block_hash 不同,即使尾部 token 相同也不会误复用。这与 radix 前缀树"节点=block_hash、路径=token 序列"一致(下"前缀树索引"),参考 vLLM `ExternalBlockHash` 的父哈希链式实现。
 
-**block 粒度 = 128 token**:缓存命中 / 复用 / 传输 / 写回的最小单位。128 为初版默认,待 P7 校准(与 SGLang `--page-size`、vLLM `block_size` 同量级)。L1–L3 统一按 128-token block、page-first 组织(两类复用条件一致、不区分类型,见 [`storage-layer.md`](storage-layer.md) "KV 类型"节)。HBM(L0)的 t-type block 同取 128,便于 L0↔L1 整块零拷贝;r-type 在 L0 不按 block 而按紧凑状态槽,落 L1+ 时再按 block 切(trailing pages 或 state checkpoint)。
+**block 粒度 = 128 token**:缓存命中 / 复用 / 传输 / 写回的最小单位。128 为初版默认,待 P7 校准(与 SGLang `--page-size`、vLLM `block_size` 同量级)。L1–L3 统一按 128-token block、page-first 组织(两类复用条件一致、不区分类型,见 [`storage-layer.md`](storage-layer.md) "KV 类型"节)。HBM(L0)的 t-type block 同取 128,便于 L0↔L1 整块零拷贝。r-type 在 L0 的布局见 [`compute-layer.md`](compute-layer.md) "L0 KV 布局(第一版)":SWA 与 t-type 同走 block arena(存 trailing window 内的 KV);Mamba 双空间——block arena 存每 `block_size` token 一份 state 快照(命中/分层用)+ 请求级 live state(`num_reqs*(1+num_speculative_tokens)`,计算用)。落 L1+ 时一律按 block 切(trailing pages 或 state checkpoint)。
 
 **模型无关**:池内命名空间是 `(model_id, revision)`(P4.5 显式 `RegisterModel`),Pool 不解释张量布局(层数、头维、dtype),按不透明字节块存取。接入新模型/revision 只需注册命名空间,无需新建池。`BlockSpec` 挂 `ModelDescriptor`,不进 `KVBlockID`。
 
@@ -412,5 +412,5 @@ ref 分两级,频率不同(解耦"每 step 高频"与"低频全局",避免 per-s
 - GC/碎片整理与数据面竞争的隔离(带宽预留 vs 优先级抢占)。
 - 碎片整理触发判定:扇出阈值、碎片率,还是周期性?
 - **block 粒度 128**:与传输带宽/写放大/碎片率的权衡,待 P7 校准。
-- **r-type 状态 checkpoint**:Mamba/卷积 recurrent state 落 L1+ 的 checkpoint 间距/形式、sliding window trailing pages 阈值,待实现/P7 校准。
+- **r-type 状态 checkpoint**:Mamba/卷积 recurrent state 落 L1+ 的 checkpoint 间距/形式、sliding window trailing pages 阈值,待实现/P7 校准。L0 的 r-type 布局第一版(Mamba block-arena checkpoint + 请求级 live state)及 decode 节点相关待讨论项(checkpoint 时机/粒度/量化、命中后释放策略、live state 槽语义、checkpoint 落层、SWA×Mamba 交互)见 [`compute-layer.md`](compute-layer.md) "L0 KV 布局(第一版)"。
 - **r-type SWA 是否落 L1+(二选一)**:SWA KV 落 L1+ trailing pages 直接命中 vs 不持久、prefix 命中时重算尾段 `n*(w-1)+1` 个 token 刷 SWA 窗口(省存储换重算,见 [`compute-layer.md`](compute-layer.md) "r-type SWA 前缀复用的尾段重算优化")。两条路线二选一,待 P7 存储成本 vs 重算成本权衡;若选重算路线,需 agent 的 slot 分配按模块差异化(只给 SWA 分 write slot,引擎契约不破)+ 残差路径区分"增量 prefill"与"刷新重算"。

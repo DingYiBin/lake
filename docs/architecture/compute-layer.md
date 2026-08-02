@@ -171,6 +171,31 @@ Idle → Boot (镜像拉起) → Warm (向存储池申请放置) → Ready → S
 - **入图影响(Q1)**:t-type 走固定 KV arena + 固定地址 block table(已定);r-type 另设**固定状态 arena**(窗口/状态槽基址入图),block table 语义不适用——按 request 槽寻址。两类 arena 独立 capture,graph 分别 replay。
 - **下层不区分**:L1–L3 按 128-token block 统一组织,两类复用条件本就一致(全前缀命中),r-type 落下层在 block 边界 checkpoint 紧凑状态(trailing pages / state 快照)。
 
+### L0 KV 布局(第一版)
+
+**整体按 block 申请**:所有层(t-type / SWA / Mamba)的 L0 空间按 block 粒度申请,每 `block_size` token 存一份。
+- t-type / SWA:每 block 存 `block_size` 个 token 的 KV(SWA 存 trailing window 内的,超出驱逐)。
+- Mamba / 线性注意力:每 block 存 **1 份 recurrent state 快照**(折叠 `block_size` 个 token 后的状态),用于前缀命中与分层迁移/驱逐。
+
+**Mamba 另开请求级 live state**:Mamba 计算还需一份在途 live state(kernel 读写、未到 block 边界的在折叠状态),按**请求条数**申请 `num_reqs * (1 + num_speculative_tokens)` 槽——`(1 + num_spec)` 对应投机一步内本请求要处理的多个位置(对齐 SGLang `mamba_ping_pong_track_buffer` 的多快照 scratch)。t-type / SWA 无此额外空间(block arena 即 kernel 读写对象,storage=compute 同体)。
+
+**对照**:
+- vLLM:统一 arena + `torch.as_strided` per-layer restride(`attn_utils.py:244`),一个 block_id 映射所有层。
+- SGLang:per-layer buffer(`get_key_buffer(layer_id)`)+ 共享 token 分配;Mamba 独立 `MambaPool` + `MambaSlotAllocator`(请求级 1 槽/请求,`allocator/mamba.py:17`);checkpoint 在 prefill chunk 边界 + 请求 finish donate(`mamba_radix_cache.py:526`),可选 int8 量化 `int8_ckpt_pool`(~2x 容量,`:1014`)。
+- **lake 第一版**:每层独立按 block 申请(不用 as_strided,区别于 vLLM);Mamba = block-arena checkpoint + 请求级 live state(对齐 SGLang 双空间思路);checkpoint 时机/粒度/量化暂取最简(见下"后续待讨论")。
+
+**关键差异**:lake 的 L0 是存储池放置副本(池拥有、池管 slot/block),计算节点只 consume;vLLM/SGLang 的 HBM 由 runner 分配持有。lake 的 block arena 与 live state arena 都归池 L0 编址,统一进放置/迁移/驱逐。
+
+**后续待讨论(r-type 存储 / decode 节点)**:
+- **Mamba checkpoint 时机**:是否每 decode step 都写 block-arena checkpoint(SGLang 不做,只在 prefill chunk + finish donate;decode token 唯一、共享价值低)。第一版先按 block 存,但"何时写 checkpoint"未定——倾向对齐 SGLang(prefill chunk 边界 + finish,decode 不 per-block 写)。
+- **Mamba checkpoint 粒度**:block_size 对齐 vs radix 节点(page 对齐)。第一版取 block_size。
+- **Mamba checkpoint 量化**:是否 int8(SGLang `int8_ckpt_pool` ~2x 容量)。第一版未定。
+- **命中后历史 state 释放**:refcounted radix 共享 + LRU 驱逐(对齐 SGLang,非命中即释放)vs 命中即释放私有 state。第一版倾向前者,待与池 radix 语义统一确认。
+- **Mamba live state `(1+num_spec)` 槽语义**:ping-pong 多快照 vs scratch,验证回滚/接受语义。
+- **checkpoint 落层**:L0 int8 ckpt 缓存 vs L2/L3 全精度(lake 分层映射)。
+- **SWA 与 Mamba 交互**:mamba tombstone / SWA window 一致性(SGLang `_match_prefix_helper` 考虑,`mamba_radix_cache.py:1049`),混合架构命中正确性。
+- **SWA trailing 是否落 L1+**:见 [`kv-cache-pool.md`](kv-cache-pool.md) 开放点(已有)。
+
 ### r-type SWA 前缀复用的尾段重算优化(idea,暂不实现)
 
 **动机**:进一步降存储——SWA 的 KV 只在窗口内有意义,不必把前缀的 SWA KV 落 L1+ 持久(本就计划 trailing only);prefix 命中复用时再重算一小段把 SWA 窗口填回来,以一小段重算换存储节省。
