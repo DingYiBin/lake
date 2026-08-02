@@ -31,6 +31,8 @@ class AttentionMetadata:
     positions: List[int] = field(default_factory=list)
     # 批级：ragged 拼接时的前缀和（预留真批融合）
     query_start_loc: List[int] = field(default_factory=list)
+    # C11+：按 req_order 排列的 seq_lens（与 block_table_tensor 同序），供 varlen 后端按位置读
+    seq_lens_ordered: List[int] = field(default_factory=list)
     max_seq_len: int = 0
     max_query_len: int = 0
     num_reqs: int = 0
@@ -82,6 +84,7 @@ def build_attn_metadata(
         slot_mapping=flat_slots,
         positions=positions,
         query_start_loc=qsl,
+        seq_lens_ordered=[seq_lens.get(rid, 0) for rid in order],
         max_seq_len=max_seq,
         max_query_len=max_q,
         num_reqs=len(order),
