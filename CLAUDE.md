@@ -80,8 +80,9 @@ docs/
 | `3rdparty/tilert` | tile-ai/TileRT | **超低延迟 decode**(tile runtime,核闭源) + **vLLM PD 插件**(`TileRTConnector`/`pd_vllm`,NIXL/Mooncake)→ 见 [`docs/research/tilert/`](docs/research/tilert/) |
 | `3rdparty/memcache` | Ascend/memcache | **昇腾分布式 KVCache 对象池**(MetaService/LocalService、HBM/DRAM/SSD、MemFabric OneCopy)→ 见 [`docs/research/memcache/`](docs/research/memcache/) |
 | `3rdparty/ucm` | ModelEngine-Group/unified-cache-management | **统一缓存框架**(可插拔 KVStore、vLLM connector、稀疏插件、PD-via-pool)→ 见 [`docs/research/ucm/`](docs/research/ucm/) |
+| `3rdparty/llama.cpp` | ggml-org/llama.cpp | **CPU attention 参照**(ggml `GGML_OP_FLASH_ATTN_EXT`：split-KV decode + tiled prefill + SIMD 分派)→ 见 [`docs/research/llama.cpp/`](docs/research/llama.cpp/)；仅作 CPU 算子设计参考,非存储/调度参考 |
 
-逐层对应、借鉴点与**关键差异**(我们更彻底:L1/L2 也归存储池而非实例私有)见 [`docs/research/3rdparty-reference.md`](docs/research/3rdparty-reference.md)。各项目的深度分析见分目录:`docs/research/{sglang,lmcache,mooncake,vllm,dynamo,tilert,memcache,ucm}/`；Transformers 仅作为模型定义源码参考。
+逐层对应、借鉴点与**关键差异**(我们更彻底:L1/L2 也归存储池而非实例私有)见 [`docs/research/3rdparty-reference.md`](docs/research/3rdparty-reference.md)。各项目的深度分析见分目录:`docs/research/{sglang,lmcache,mooncake,vllm,dynamo,tilert,memcache,ucm,llama.cpp}/`；Transformers 仅作为模型定义源码参考。
 
 约定:
 - `3rdparty/` **只读**,不修改 submodule 内代码。要改造先 fork 换 URL。
@@ -115,6 +116,8 @@ docs/
    - **vLLM Q3 KV/Session 调度**(#48168 agent prefix · #48501 `session_id`/`continuation_id` · retention) → `docs/research/vllm/kv-session-roadmap.md`
    - **编排层/控制面**:KV-aware router(overlap 量化) + KVBM logical/physical/engine 三层 offload + Placement/StorageTier(介质非位置) + 链式 block 哈希 + 多后端通信(etcd/nats/tcp/zmq) → `docs/research/dynamo/overview.md`
    - **超低延迟 decode / vLLM PD 插件**(TileRT):connector claim、MTP-aware 传 KV、NIXL/Mooncake → `docs/research/tilert/{overview,pd-vllm,pain-points}.md`（核闭源,不作存储面参考）
+   - **Attention 后端对照**(SGLang × vLLM):基类/分派/metadata、各平台 kernel 来源、model runner、MIXED 与并行度 → `docs/research/attention-backends.md`
+   - **CPU attention 参照**(llama.cpp):ggml `GGML_OP_FLASH_ATTN_EXT`(split-KV decode + tiled prefill + SIMD 分派),CPU 上有无 FA2 等价物 → `docs/research/llama.cpp/overview.md`（仅 CPU 算子参考,非存储/调度参考）
    - 跨项目逐层对应与借鉴顺序 → `docs/research/3rdparty-reference.md`
 3. **沿代码回溯**：每个参考文档末尾都有「代码索引」节，把概念/机制映射到 `文件:符号`。符号名是稳定锚点（行号会漂移，找不到时 `grep -n "符号名" 3rdparty/<repo>/<文件路径>`）。需要确认实现细节时，直接读对应符号的源码。
 

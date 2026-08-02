@@ -11,6 +11,7 @@
 - [`tilert/`](tilert/) — TileRT:[总览](tilert/overview.md) · [vLLM PD 插件](tilert/pd-vllm.md) · [痛点与 lake 对照](tilert/pain-points.md)
 - [`memcache/`](memcache/) — Ascend MemCache:[总览](memcache/overview.md) · [架构](memcache/architecture.md) · [痛点与 lake 对照](memcache/pain-points.md)
 - [`ucm/`](ucm/) — UCM(ModelEngine):[总览](ucm/overview.md) · [架构](ucm/architecture.md) · [痛点与 lake 对照](ucm/pain-points.md)
+- [`llama.cpp/`](llama.cpp/) — llama.cpp:[总览](llama.cpp/overview.md) · CPU attention 参照(ggml `GGML_OP_FLASH_ATTN_EXT`：split-KV decode + tiled prefill + SIMD 分派)；仅 CPU 算子参考
 - [guided-decoding.md](guided-decoding.md) — **Guided / structured decoding**(SGLang × vLLM):xgrammar/llguidance 库边界、overlap/async 下能否消同步、spec+grammar 硬缺口
 - [sampling-params.md](sampling-params.md) — **Sampling 参数对照**(SGLang × vLLM):核心/独有字段、`n`≠beam、spec 禁 min_p/logit_bias；penalty 空泡与 V2；采样状态归属 / Spec 兼容矩阵 / `n` 与前缀 KV 共享
 - [scheduler-worker-interface.md](scheduler-worker-interface.md) — **Scheduler→Worker 字段全集**(SGLang × vLLM):`SchedulerOutput` vs `ScheduleBatch`/`ForwardBatch`、差异表、架构根因、对 lake D1 含义
@@ -31,6 +32,7 @@
 | `3rdparty/tilert` | [tile-ai/TileRT](https://github.com/tile-ai/TileRT) | main HEAD (`a8368a6`, v0.1.5) | **超低延迟 decode** + **vLLM PD 插件**(`TileRTConnector`);见 [tilert/](tilert/) |
 | `3rdparty/memcache` | [Ascend/memcache](https://github.com/Ascend/memcache) | master HEAD (`14b4e35`) | **昇腾 KV 对象池** Meta/Local + MemFabric;见 [memcache/](memcache/) |
 | `3rdparty/ucm` | [ModelEngine-Group/unified-cache-management](https://github.com/modelengine-group/unified-cache-management) | main HEAD (`37af15e`) | **统一缓存框架** store+connector+PD-via-pool;见 [ucm/](ucm/) |
+| `3rdparty/llama.cpp` | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | 浅克隆 `--depth 1` (`7a2db1a`) | **CPU attention 参照** ggml `GGML_OP_FLASH_ATTN_EXT`(split-KV decode + tiled prefill + SIMD);见 [llama.cpp/](llama.cpp/) |
 
 > 生态相连:vLLM `KVConnectorBase_V1` 被 LMCache/Mooncake/NIXL/FlexKV/**TileRT**/**UCM** 等实现;vLLM-Ascend 另将 **MemCache** 列为 KV Pool backend;SGLang HiCache 把 Mooncake 作 L3;Dynamo 编排 vLLM/SGLang;UCM 主推经统一池做 PD;TileRT 做低延迟 decode。我们站在其上做更彻底的存算分离。
 
