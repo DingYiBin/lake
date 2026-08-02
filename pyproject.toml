@@ -29,6 +29,10 @@ dependencies = [
 # (或手动装 GitHub release 预编译 wheel 规避编译)。FlashAttn2Backend 用其
 # `flash_attn_varlen_func`(FA2 paged varlen,block_table 自 2.x 支持)。
 cuda = ["triton"]
+
+# dev 走 PEP 735 dependency-groups(uv 默认装 default-groups=[dev]),
+# 免去每次 `uv sync --extra dev`。
+[dependency-groups]
 dev = [
     "grpcio-tools==1.82.1",
     "pytest>=8",

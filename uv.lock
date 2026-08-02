@@ -352,6 +352,8 @@ dependencies = [
 cuda = [
     { name = "triton" },
 ]
+
+[package.dev-dependencies]
 dev = [
     { name = "grpcio-tools" },
     { name = "pytest" },
@@ -361,16 +363,20 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "grpcio", specifier = ">=1.82.1" },
-    { name = "grpcio-tools", marker = "extra == 'dev'", specifier = "==1.82.1" },
     { name = "numpy", specifier = "==2.2.6" },
     { name = "protobuf", specifier = ">=7.35.0" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.8" },
     { name = "torch", specifier = "==2.11.0" },
     { name = "transformers" },
     { name = "triton", marker = "extra == 'cuda'" },
 ]
-provides-extras = ["cuda", "dev"]
+provides-extras = ["cuda"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "grpcio-tools", specifier = "==1.82.1" },
+    { name = "pytest", specifier = ">=8" },
+    { name = "ruff", specifier = ">=0.8" },
+]
 
 [[package]]
 name = "markdown-it-py"
