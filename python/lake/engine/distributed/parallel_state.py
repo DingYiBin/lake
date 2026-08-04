@@ -116,7 +116,11 @@ def find_group_containing(groups: Sequence[Sequence[int]], rank: int) -> List[in
 
 @dataclass
 class GroupCoordinator:
-    """通信组视图。collective 后端（NCCL/custom AR）后续挂在此对象上。"""
+    """通信组视图。collective 走 ``device_group``（有则 ``torch.distributed``）。
+
+    ``world_size == 1`` 时 all_reduce / all_gather 为恒等，便于单卡与单测。
+    自定义 AR / PyNCCL 后续挂此对象，接口保持不变。
+    """
 
     ranks: List[int]
     rank: int  # global rank
@@ -140,6 +144,60 @@ class GroupCoordinator:
     @property
     def is_last_rank(self) -> bool:
         return self.rank_in_group == self.world_size - 1
+
+    def all_reduce(self, input_: "torch.Tensor") -> "torch.Tensor":
+        """Out-of-place all-reduce。``world_size==1`` 直接返回。"""
+        import torch
+        import torch.distributed as dist
+
+        if self.world_size == 1:
+            return input_
+        if self.device_group is None:
+            raise RuntimeError(
+                f"GroupCoordinator({self.group_name}) has no device_group for all_reduce "
+                f"(world_size={self.world_size})"
+            )
+        out = input_.clone()
+        dist.all_reduce(out, group=self.device_group)
+        return out
+
+    def all_gather(self, input_: "torch.Tensor", dim: int = -1) -> "torch.Tensor":
+        """沿 ``dim`` all-gather 后 cat。``world_size==1`` 直接返回。"""
+        import torch
+        import torch.distributed as dist
+
+        if self.world_size == 1:
+            return input_
+        if self.device_group is None:
+            raise RuntimeError(
+                f"GroupCoordinator({self.group_name}) has no device_group for all_gather "
+                f"(world_size={self.world_size})"
+            )
+        if dim < 0:
+            dim += input_.dim()
+        tensor_list = [torch.empty_like(input_) for _ in range(self.world_size)]
+        dist.all_gather(tensor_list, input_.contiguous(), group=self.device_group)
+        return torch.cat(tensor_list, dim=dim)
+
+
+def resolve_comm_group(
+    pg: Optional[GroupCoordinator] = None,
+) -> GroupCoordinator:
+    """解析 linear 等层使用的通讯域：显式 ``pg`` → 默认 TP → 单卡 fallback。
+
+    单卡 fallback 仅用于尚未 ``initialize_model_parallel`` 的构造/单测；
+    多卡务必先建组或显式传入 ``pg``。
+    """
+    if pg is not None:
+        return pg
+    if model_parallel_is_initialized():
+        return get_tp_group()
+    return GroupCoordinator(
+        ranks=[0],
+        rank=0,
+        local_rank=0,
+        group_name="tp-fallback",
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -290,7 +290,7 @@ HBM 也归存储池后(见 [`overview.md`](overview.md) / [`kv-cache-pool.md`](k
 | `parallel_state` | `python/lake/engine/distributed/parallel_state.py` | `GroupCoordinator` + `initialize_model_parallel`；切出 TP/PP/DP 组 |
 | 挂点 | `RoleConfig.parallel`；`WorkerEngine.start` → `ensure_model_parallel_initialized`（load 前） | 对齐 vLLM `init_worker_distributed_environment` |
 
-**当前约束**：默认 `tp=dp=pp=1`，不碰 `torch.distributed`。`world_size_across_dp > 1` 时先 `init_distributed_environment` 再建子组；collective 后端（NCCL / custom AR）与 parallel linear 尚未挂接。选路仍归 Go Router，worker 不内置 DP LB。对照见 [`../research/parallelism-tp-dp.md`](../research/parallelism-tp-dp.md)。
+**当前约束**：默认 `tp=dp=pp=1`，不碰 `torch.distributed`。`world_size_across_dp > 1` 时先 `init_distributed_environment` 再建子组。并行 Linear 在 `layers/linear/`（一类一文件）：`Column`/`Row`（`pg` 可指定，默认 TP）、`Replicated`（全复制、无集体通信）。collective 走 `GroupCoordinator` + `torch.distributed`；custom AR / NCCL 优化路径未挂。选路仍归 Go Router。对照见 [`../research/parallelism-tp-dp.md`](../research/parallelism-tp-dp.md)。
 
 proto 预留 per-rank 字段；MLA 多 rank 回写去重(SGLang 设计 doc 提及)留作后续参考。
 

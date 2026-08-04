@@ -276,10 +276,14 @@ lake 倾向（已有文档口径）：副本内 **一份调度决策 + 多卡执
 |------|-----------|------|
 | 配置 | `python/lake/engine/config/parallel.py::ParallelConfig`（`RoleConfig` 同包） | `tp/pp/dp`、`world_size(_across_dp)`、env `LAKE_*` |
 | mesh 切组 | `python/lake/engine/distributed/parallel_state.py::{tp,pp,dp}_group_ranks` / `initialize_model_parallel` | 与 vLLM reshape 同序（PCP=1） |
-| 组对象 | `…/parallel_state.py::GroupCoordinator` | ranks + 可选 ProcessGroup；AR 后端未挂 |
+| 组对象 | `…/parallel_state.py::GroupCoordinator` | ranks + `all_reduce`/`all_gather`（有 `device_group` 时）；custom AR 未挂 |
+| 通讯封装 | `…/communication_op.py` | 可传 `group`；默认 TP |
+| 并行 Linear | `python/lake/engine/model_executor/layers/linear/`（一类一文件） | `Column`/`Row` 可 `pg=`（默认 TP）；`Replicated` 全复制、无集体通信 |
 | 进程挂点 | `RoleConfig.parallel`；`WorkerEngine.start` → `ensure_model_parallel_initialized` | 单卡跳过 dist；多卡需先 `init_distributed_environment` |
 
-**未做**：NCCL/custom AR、`communication_op`、Column/RowParallel、多进程 launcher、Router↔DP rank 头。
+**与 vLLM 差异（linear）**：vLLM 的 Column/Row **硬编码** `get_tp_group()`（经 `communication_op`）；lake 允许 `pg: GroupCoordinator | None`。`ReplicatedLinear` 与 vLLM 同：不使用通讯域。包路径按类拆分（vLLM 仍单文件 `linear.py`）。
+
+**未做**：NCCL/custom AR、QKV/MergedColumn、多进程 launcher、Router↔DP rank 头。
 
 ---
 

@@ -5,6 +5,10 @@
 """
 
 from lake.engine.config.parallel import ParallelConfig
+from lake.engine.distributed.communication_op import (
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
+)
 from lake.engine.distributed.parallel_state import (
     GroupCoordinator,
     destroy_model_parallel,
@@ -23,6 +27,7 @@ from lake.engine.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
     model_parallel_is_initialized,
+    resolve_comm_group,
 )
 
 __all__ = [
@@ -44,4 +49,7 @@ __all__ = [
     "init_distributed_environment",
     "initialize_model_parallel",
     "model_parallel_is_initialized",
+    "resolve_comm_group",
+    "tensor_model_parallel_all_gather",
+    "tensor_model_parallel_all_reduce",
 ]

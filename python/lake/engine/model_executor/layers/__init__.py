@@ -1,11 +1,25 @@
 from lake.engine.model_executor.layers.attentions import AttentionMetadata, build_attn_metadata
+from lake.engine.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    ColumnParallelLinearLayer,
+    ReplicatedLinear,
+    ReplicatedLinearLayer,
+    RowParallelLinear,
+    RowParallelLinearLayer,
+)
 
 __all__ = [
     "AttentionBackend",
     "AttentionMetadata",
+    "ColumnParallelLinear",
+    "ColumnParallelLinearLayer",
     "CpuAttentionBackend",
     "FlashAttn2Backend",
     "RefAttentionBackend",
+    "ReplicatedLinear",
+    "ReplicatedLinearLayer",
+    "RowParallelLinear",
+    "RowParallelLinearLayer",
     "build_attn_backend",
     "build_attn_metadata",
 ]
