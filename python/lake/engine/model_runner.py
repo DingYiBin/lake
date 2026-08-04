@@ -182,7 +182,10 @@ class ModelRunner:
         output: SchedulerOutput,
         host_reqs: Mapping[str, Req],
     ) -> InputBatch:
-        """对齐 vLLM `prepare_inputs`：组本步 InputBatch（无跨步 RequestState）。"""
+        """对齐 vLLM `prepare_inputs`：组本步 InputBatch（无跨步 RequestState）。
+
+        P2：行稠密追加（平行于 ``req_ids``），不再按 req_id 建 dict。
+        """
         batch = InputBatch()
         spec_map = output.scheduled_spec_decode_tokens or {}
         for req_id, n in output.num_scheduled_tokens.items():
@@ -195,16 +198,13 @@ class ModelRunner:
             computed = output.req_num_computed_at_schedule.get(req_id, req.num_computed_tokens)
             query_start = output.req_query_start.get(req_id)
             query_end = output.req_query_end.get(req_id)
-            batch.req_ids.append(req_id)
-            batch.num_scheduled_tokens[req_id] = n
-            batch.num_computed_tokens[req_id] = computed
             if computed < prompt_len:
                 start = computed if query_start is None else query_start
                 end = min(prompt_len, query_end if query_end is not None else computed + n)
-                batch.token_ids[req_id] = list(req.prompt_token_ids[:end])
-                batch.query_start[req_id] = start
-                batch.query_end[req_id] = end
-                batch.is_prompt_phase[req_id] = True
+                tokens = list(req.prompt_token_ids[:end])
+                qs = start
+                qe = end
+                is_prompt = True
             else:
                 ctx = list(req.all_token_ids)
                 draft = list(spec_map.get(req_id) or [])[: max(0, n - 1)]
@@ -220,18 +220,30 @@ class ModelRunner:
                 if len(tokens) < qe:
                     pad = tokens[-1] if tokens else 0
                     tokens.extend([pad] * (qe - len(tokens)))
-                batch.token_ids[req_id] = tokens[:qe]
-                batch.query_start[req_id] = qs
-                batch.query_end[req_id] = qe
-                batch.is_prompt_phase[req_id] = False
+                tokens = tokens[:qe]
+                is_prompt = False
+            batch.add_request(
+                req_id,
+                num_scheduled_tokens=n,
+                num_computed_tokens=computed,
+                token_ids=tokens,
+                query_start=qs,
+                query_end=qe,
+                is_prompt_phase=is_prompt,
+            )
         self._input_batch = batch
         return batch
 
     def prepare_attn(self, batch: InputBatch, ready: ReadyHandle) -> AttentionMetadata:
-        """对齐 vLLM `prepare_attn`：几何 + agent block table（只读）。"""
-        seq_lens = {}
-        for rid in batch.req_ids:
-            seq_lens[rid] = batch.query_end[rid]
+        """对齐 vLLM `prepare_attn`：几何 + agent block table（只读）。
+
+        ``build_attn_metadata`` 取 req_id-keyed 几何权威（亦可来自 scheduler），
+        故此处由行稠密 batch 构一过性 dict 视图。
+        """
+        order = batch.req_ids
+        seq_lens = {rid: batch.query_end[row] for row, rid in enumerate(order)}
+        query_start = {rid: batch.query_start[row] for row, rid in enumerate(order)}
+        query_end = {rid: batch.query_end[row] for row, rid in enumerate(order)}
         self._input_buffers.materialize(
             batch,
             slot_mapping_by_req=ready.slot_mapping_by_req,
@@ -239,11 +251,11 @@ class ModelRunner:
         )
         meta = build_attn_metadata(
             seq_lens=seq_lens,
-            query_start=batch.query_start,
-            query_end=batch.query_end,
+            query_start=query_start,
+            query_end=query_end,
             block_tables=ready.block_table_by_req,
             buffers=self._input_buffers,
-            req_order=batch.req_ids,
+            req_order=order,
         )
         self._attn_meta = meta
         return meta
@@ -320,8 +332,8 @@ class ModelRunner:
     ) -> Tuple[Dict[str, List[int]], Dict[str, List[int]]]:
         assert self._model is not None
         last_logits: Dict[str, List[float]] = {}
-        for req_id in batch.req_ids:
-            if batch.is_prompt_phase.get(req_id, False):
+        for row, req_id in enumerate(batch.req_ids):
+            if batch.is_prompt_phase[row]:
                 continue
             req = host_reqs.get(req_id)
             if req is None:

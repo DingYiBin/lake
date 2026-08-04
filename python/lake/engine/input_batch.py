@@ -1,7 +1,7 @@
 """本步静态 / 批 buffer（非跨步请求权威）。
 
 对齐 vLLM V2 ``InputBatch`` / ``InputBuffers`` 子集：
-- ``InputBatch``：host 轻量几何（req_ids / dict），供 materialize
+- ``InputBatch``：host 轻量几何（行稠密 list，平行于 ``req_ids``），供 materialize
 - ``InputBuffers``：预分配 **device tensor**（固定地址）；CUDA 经 pin staging H2D
 
 Host ``Req`` 权威仍在 ``node_scheduler``。计划见
@@ -20,15 +20,23 @@ DeviceLike = Union[str, torch.device]
 
 @dataclass
 class InputBatch:
+    """本步 host 批几何（行稠密，对齐 vLLM V2 ``InputBatch`` 行索引形态）。
+
+    所有按请求字段均为 ``list``、与 ``req_ids`` 行对齐（row = 在 ``req_ids``
+    中的位置）。无跨步 ``RequestState``：本步构建、本步消费后丢弃。
+    P2：由 dict-by-req_id 收敛为行稠密（见 ``input-batch-device.md``）。
+    """
+
     req_ids: List[str] = field(default_factory=list)
-    num_scheduled_tokens: Dict[str, int] = field(default_factory=dict)
-    num_computed_tokens: Dict[str, int] = field(default_factory=dict)
+    # [num_reqs] 行稠密，平行于 req_ids
+    num_scheduled_tokens: List[int] = field(default_factory=list)
+    num_computed_tokens: List[int] = field(default_factory=list)
     # 每请求：本步前向可见的 token 前缀（长度 = query_end）
-    token_ids: Dict[str, List[int]] = field(default_factory=dict)
-    query_start: Dict[str, int] = field(default_factory=dict)
-    query_end: Dict[str, int] = field(default_factory=dict)
+    token_ids: List[List[int]] = field(default_factory=list)
+    query_start: List[int] = field(default_factory=list)
+    query_end: List[int] = field(default_factory=list)
     # prompt 相 vs 生成相（供 sample 跳过 extend）
-    is_prompt_phase: Dict[str, bool] = field(default_factory=dict)
+    is_prompt_phase: List[bool] = field(default_factory=list)
 
     def clear(self) -> None:
         self.req_ids.clear()
@@ -38,6 +46,30 @@ class InputBatch:
         self.query_start.clear()
         self.query_end.clear()
         self.is_prompt_phase.clear()
+
+    def add_request(
+        self,
+        req_id: str,
+        *,
+        num_scheduled_tokens: int,
+        num_computed_tokens: int,
+        token_ids: List[int],
+        query_start: int,
+        query_end: int,
+        is_prompt_phase: bool,
+    ) -> None:
+        """按行追加一个请求的本步几何；所有字段平行于 ``req_ids``。"""
+        self.req_ids.append(req_id)
+        self.num_scheduled_tokens.append(num_scheduled_tokens)
+        self.num_computed_tokens.append(num_computed_tokens)
+        self.token_ids.append(token_ids)
+        self.query_start.append(query_start)
+        self.query_end.append(query_end)
+        self.is_prompt_phase.append(is_prompt_phase)
+
+    def index_of(self, req_id: str) -> int:
+        """req_id -> 行下标（行稠密下按需查找；batch 量级小，O(n) 可接受）。"""
+        return self.req_ids.index(req_id)
 
 
 class InputBuffers:
@@ -165,8 +197,8 @@ class InputBuffers:
         btl = self._write_target("block_table_lens")
 
         for row, req_id in enumerate(batch.req_ids):
-            qs = batch.query_start[req_id]
-            qe = batch.query_end[req_id]
+            qs = batch.query_start[row]
+            qe = batch.query_end[row]
             q_len = max(0, qe - qs)
             if cursor + q_len > self.max_num_tokens:
                 raise ValueError(
@@ -174,7 +206,7 @@ class InputBuffers:
                 )
             qsl[row] = cursor
             seq[row] = qe
-            tokens = batch.token_ids[req_id][qs:qe]
+            tokens = batch.token_ids[row][qs:qe]
             req_slots = slots.get(req_id)
             if req_slots is not None and len(req_slots) != q_len:
                 raise ValueError(

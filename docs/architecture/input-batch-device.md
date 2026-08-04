@@ -58,9 +58,12 @@ model forward / FA2 /（未来 graph）
 - `block_table_tensor` → 固定 `[max_reqs, max_blocks]` int32 + `block_table_lens`
 - FA2 / CpuAttention 读 tensor，不再现场从 Python list 建临时 tensor
 
-### P2 — 压缩 host `InputBatch`（后续）
+### P2 — 压缩 host `InputBatch`（本轮）
 
-- dict → 按 batch 行稠密；或 `prepare_inputs` 直写 staging
+- dict-by-req_id → **行稠密 list**（平行于 `req_ids`，row = 在 `req_ids` 中的位置），对齐 vLLM V2 `InputBatch` 行索引形态
+- `InputBatch.add_request(...)` 按行追加；`index_of(req_id)` 按需反查
+- `InputBuffers.materialize` 直接按行迭代（不再 `dict[req_id]` 查找）
+- `prepare_attn` 由行稠密 batch 构一过性 req_id-keyed dict 视图喂 `build_attn_metadata`（builder 仍取 dict 几何权威，亦可来自 scheduler）
 
 ### P3 — device pack（后续，可选）
 
@@ -79,4 +82,5 @@ model forward / FA2 /（未来 graph）
 | 计划文档 | **done** |
 | P0 InputBuffers | **done**（`device` + pin staging H2D；默认 cpu） |
 | P1 AttentionMetadata | **done**（热路径 tensor + 2D `block_table`；FA2/Cpu 消费） |
-| P2 / P3 | pending |
+| P2 压缩 host `InputBatch` | **done**（行稠密 list 平行于 `req_ids`；`add_request` / `index_of`；materialize 按行迭代） |
+| P3 device pack | pending（可选） |

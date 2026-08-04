@@ -38,8 +38,9 @@ def test_prepare_inputs_attn_metadata() -> None:
         req_forward_modes={"r": ForwardMode.EXTEND},
     )
     batch = runner.prepare_inputs(out, {"r": req})
-    assert batch.query_start["r"] == 2 and batch.query_end["r"] == 5
-    assert batch.is_prompt_phase["r"] is True
+    r = batch.index_of("r")
+    assert batch.query_start[r] == 2 and batch.query_end[r] == 5
+    assert batch.is_prompt_phase[r] is True
     ready = ReadyHandle(step_id=1, block_table_by_req={"r": [0, 1]})
     meta = runner.prepare_attn(batch, ready)
     assert meta.block_tables["r"] == [0, 1]
@@ -65,8 +66,9 @@ def test_decode_slot_mapping_matches_query_position() -> None:
         req_forward_modes={"r": ForwardMode.DECODE},
     )
     batch = runner.prepare_inputs(out, {"r": req})
-    assert batch.query_start["r"] == 3
-    assert batch.query_end["r"] == 4
+    r = batch.index_of("r")
+    assert batch.query_start[r] == 3
+    assert batch.query_end[r] == 4
 
     ready = ReadyHandle(
         step_id=2,
@@ -95,9 +97,10 @@ def test_prepare_inputs_uses_scheduler_query_geometry_under_overlap() -> None:
     )
 
     batch = runner.prepare_inputs(out, {"r": req})
-    assert batch.query_start["r"] == 4
-    assert batch.query_end["r"] == 5
-    assert len(batch.token_ids["r"]) == 5
+    r = batch.index_of("r")
+    assert batch.query_start[r] == 4
+    assert batch.query_end[r] == 5
+    assert len(batch.token_ids[r]) == 5
 
     ready = ReadyHandle(
         step_id=3,
@@ -145,9 +148,9 @@ def test_build_attn_metadata_loc() -> None:
 def test_input_buffers_materialize_ragged_queries() -> None:
     batch = InputBatch(
         req_ids=["a", "b"],
-        token_ids={"a": [10, 11, 12, 13], "b": [20, 21, 22]},
-        query_start={"a": 1, "b": 2},
-        query_end={"a": 4, "b": 3},
+        token_ids=[[10, 11, 12, 13], [20, 21, 22]],
+        query_start=[1, 2],
+        query_end=[4, 3],
     )
     buffers = InputBuffers(max_num_reqs=4, max_num_tokens=8)
     buffers.materialize(
