@@ -82,6 +82,11 @@ def test_qwen3_load_weights_keeps_model_api_plain() -> None:
 
 
 def test_qwen3_module_tree_matches_vllm_packed_layout() -> None:
+    from lake.engine.model_executor.layers.linear import (
+        ColumnParallelLinearLayer,
+        RowParallelLinearLayer,
+    )
+
     model = Qwen3ForCausalLM(QWEN3_0_6B_CONFIG)
     layer0 = model.model.layers[0]
     head_dim = QWEN3_0_6B_CONFIG.head_dim
@@ -92,6 +97,10 @@ def test_qwen3_module_tree_matches_vllm_packed_layout() -> None:
         QWEN3_0_6B_CONFIG.vocab_size,
         QWEN3_0_6B_CONFIG.hidden_size,
     )
+    assert isinstance(layer0.self_attn.qkv_proj, ColumnParallelLinearLayer)
+    assert isinstance(layer0.self_attn.o_proj, RowParallelLinearLayer)
+    assert isinstance(layer0.mlp.gate_up_proj, ColumnParallelLinearLayer)
+    assert isinstance(layer0.mlp.down_proj, RowParallelLinearLayer)
     assert layer0.self_attn.qkv_proj.weight.shape == (
         q_size + (2 * kv_size),
         QWEN3_0_6B_CONFIG.hidden_size,
@@ -100,6 +109,8 @@ def test_qwen3_module_tree_matches_vllm_packed_layout() -> None:
         QWEN3_0_6B_CONFIG.hidden_size,
         q_size,
     )
+    assert layer0.self_attn.num_heads == QWEN3_0_6B_CONFIG.num_attention_heads
+    assert layer0.self_attn.num_kv_heads == QWEN3_0_6B_CONFIG.num_key_value_heads
     assert layer0.self_attn.q_norm.weight.shape == (head_dim,)
     assert layer0.self_attn.k_norm.weight.shape == (head_dim,)
     assert layer0.mlp.gate_up_proj.weight.shape == (

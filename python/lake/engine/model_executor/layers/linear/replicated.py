@@ -31,6 +31,7 @@ class ReplicatedLinearLayer(LinearBase):
         return_bias: bool = False,
         pg: Optional[GroupCoordinator] = None,
         disable_tp: bool = False,
+        device: Optional[torch.device | str] = None,
     ) -> None:
         # 权重始终全量；强制单卡组语义，避免误用 tp_size 切分。
         super().__init__(
@@ -42,23 +43,22 @@ class ReplicatedLinearLayer(LinearBase):
             return_bias=return_bias,
             pg=pg,
             disable_tp=True,
+            device=device,
         )
         # 保留调用方传入值，便于日志/对照（与 vLLM「disable_tp 无效果」一致）
         self.disable_tp = disable_tp
         self.output_partition_sizes = [output_size]
 
-        self.weight = nn.Parameter(
-            torch.empty(self.output_size, self.input_size, dtype=self.params_dtype)
-        )
+        self.weight = nn.Parameter(self._empty(self.output_size, self.input_size))
         if bias:
-            self.bias = nn.Parameter(
-                torch.empty(self.output_size, dtype=self.params_dtype)
-            )
+            self.bias = nn.Parameter(self._empty(self.output_size))
         else:
             self.register_parameter("bias", None)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
+        if self.weight.device.type == "meta":
+            return
         nn.init.kaiming_uniform_(self.weight, a=5**0.5)
         if self.bias is not None:
             nn.init.zeros_(self.bias)

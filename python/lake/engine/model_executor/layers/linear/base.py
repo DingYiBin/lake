@@ -31,6 +31,7 @@ class LinearBase(nn.Module):
         return_bias: bool = False,
         pg: Optional[GroupCoordinator] = None,
         disable_tp: bool = False,
+        device: Optional[torch.device | str] = None,
     ) -> None:
         super().__init__()
         self.input_size = input_size
@@ -38,6 +39,7 @@ class LinearBase(nn.Module):
         self.skip_bias_add = skip_bias_add
         self.return_bias = return_bias
         self.disable_tp = disable_tp
+        self.device = device
         self.params_dtype = (
             params_dtype if params_dtype is not None else torch.get_default_dtype()
         )
@@ -49,6 +51,9 @@ class LinearBase(nn.Module):
             self.pg = resolve_comm_group(pg)
         self.tp_size = self.pg.world_size
         self.tp_rank = self.pg.rank_in_group
+
+    def _empty(self, *shape: int) -> torch.Tensor:
+        return torch.empty(*shape, dtype=self.params_dtype, device=self.device)
 
     def _maybe_return(
         self, output: torch.Tensor, bias: Optional[nn.Parameter]

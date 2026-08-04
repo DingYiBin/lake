@@ -37,6 +37,7 @@ class RowParallelLinearLayer(LinearBase):
         return_bias: bool = False,
         pg: Optional[GroupCoordinator] = None,
         disable_tp: bool = False,
+        device: Optional[torch.device | str] = None,
     ) -> None:
         super().__init__(
             input_size,
@@ -47,6 +48,7 @@ class RowParallelLinearLayer(LinearBase):
             return_bias=return_bias,
             pg=pg,
             disable_tp=disable_tp,
+            device=device,
         )
         self.input_is_parallel = input_is_parallel
         self.reduce_results = reduce_results
@@ -59,21 +61,20 @@ class RowParallelLinearLayer(LinearBase):
             )
 
         self.weight = nn.Parameter(
-            torch.empty(
+            self._empty(
                 self.output_size_per_partition,
                 self.input_size_per_partition,
-                dtype=self.params_dtype,
             )
         )
         if bias:
-            self.bias = nn.Parameter(
-                torch.empty(self.output_size, dtype=self.params_dtype)
-            )
+            self.bias = nn.Parameter(self._empty(self.output_size))
         else:
             self.register_parameter("bias", None)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
+        if self.weight.device.type == "meta":
+            return
         nn.init.kaiming_uniform_(self.weight, a=5**0.5)
         if self.bias is not None:
             nn.init.zeros_(self.bias)

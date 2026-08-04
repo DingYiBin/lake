@@ -1,8 +1,12 @@
 """Qwen3 model runtime skeleton.
 
 类名与 vLLM `Qwen3ForCausalLM` 对齐；config 由模型加载侧从 Hugging Face
-config 读取后传入。本阶段经通用 `DummyModelLoader` 建立权重加载边界和
-deterministic forward 占位，不加载真实 safetensors。
+config 读取后传入。Linear 对齐 vLLM：``qkv_proj``/``gate_up_proj`` 用
+ColumnParallel（QKV/MergedColumn 专用类后续替换）、``o_proj``/``down_proj``
+用 RowParallel；``lm_head`` 未 tie 时用 ColumnParallel（占位 ParallelLMHead）。
+
+本阶段经通用 `DummyModelLoader` 建立权重加载边界和 deterministic forward
+占位，不加载真实 safetensors。
 """
 
 from __future__ import annotations
@@ -13,6 +17,12 @@ from typing import TYPE_CHECKING
 import torch
 from torch import nn
 from transformers import Qwen3Config
+
+from lake.engine.distributed.parallel_state import resolve_comm_group
+from lake.engine.model_executor.layers.linear import (
+    ColumnParallelLinearLayer,
+    RowParallelLinearLayer,
+)
 
 if TYPE_CHECKING:
     from lake.engine.model_executor.layers.attentions import (
@@ -34,6 +44,11 @@ def _param_dtype(config: Qwen3Config) -> torch.dtype:
 
 def _head_dim(config: Qwen3Config) -> int:
     return int(getattr(config, "head_dim", config.hidden_size // config.num_attention_heads))
+
+
+def _tp_world_size() -> int:
+    """当前默认 TP 组大小（未 init parallel 时为 1）。"""
+    return resolve_comm_group(None).world_size
 
 
 class Qwen3RMSNorm(nn.Module):
@@ -120,7 +135,12 @@ class Qwen3PagedAttention(nn.Module):
 
 
 class Qwen3Attention(nn.Module):
-    """Qwen3 attention shell following vLLM's packed qkv projection layout."""
+    """Qwen3 attention shell；投影对齐 vLLM ``Qwen3Attention``。
+
+    ``qkv_proj`` 暂用 ``ColumnParallelLinear`` 承载 packed QKV（完整
+    ``QKVParallelLinear`` 含 KV head 复制逻辑，后续替换）；``o_proj`` 为
+    ``RowParallelLinear``。本地 ``num_heads`` / ``num_kv_heads`` 按 TP 切分。
+    """
 
     def __init__(self, config: Qwen3Config, layer_idx: int, *, attn_backend: AttentionBackend | None = None) -> None:
         super().__init__()
@@ -131,28 +151,58 @@ class Qwen3Attention(nn.Module):
         self.total_num_heads = config.num_attention_heads
         self.total_num_kv_heads = config.num_key_value_heads
         self.head_dim = _head_dim(config)
-        self.q_size = self.total_num_heads * self.head_dim
-        self.kv_size = self.total_num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-        self.qkv_proj = nn.Linear(
-            self.hidden_size,
-            self.q_size + (2 * self.kv_size),
-            bias=getattr(config, "attention_bias", False),
-            device="meta",
-            dtype=dtype,
+
+        tp_size = _tp_world_size()
+        if self.total_num_heads % tp_size != 0:
+            raise ValueError(
+                f"num_attention_heads={self.total_num_heads} not divisible by tp_size={tp_size}"
+            )
+        self.num_heads = self.total_num_heads // tp_size
+        if self.total_num_kv_heads >= tp_size:
+            if self.total_num_kv_heads % tp_size != 0:
+                raise ValueError(
+                    f"num_key_value_heads={self.total_num_kv_heads} not divisible by tp_size={tp_size}"
+                )
+            self.num_kv_heads = self.total_num_kv_heads // tp_size
+        else:
+            if tp_size % self.total_num_kv_heads != 0:
+                raise ValueError(
+                    f"tp_size={tp_size} not divisible by num_key_value_heads={self.total_num_kv_heads}"
+                )
+            self.num_kv_heads = 1
+        # 本地 split 宽度（与 vLLM Qwen3Attention 一致）
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+
+        # packed 总输出维；ColumnParallel 按 tp 切分。KV 复制场景下与真
+        # QKVParallelLinear 的分片布局可能不一致——TP>1 且 total_kv < tp 时待专类。
+        qkv_out = (
+            self.total_num_heads * self.head_dim
+            + 2 * self.total_num_kv_heads * self.head_dim
         )
-        self.o_proj = nn.Linear(
-            self.q_size,
+        self.qkv_proj = ColumnParallelLinearLayer(
+            self.hidden_size,
+            qkv_out,
+            bias=bool(getattr(config, "attention_bias", False)),
+            gather_output=False,
+            params_dtype=dtype,
+            device="meta",
+        )
+        self.o_proj = RowParallelLinearLayer(
+            self.total_num_heads * self.head_dim,
             self.hidden_size,
             bias=False,
+            input_is_parallel=True,
+            reduce_results=True,
+            params_dtype=dtype,
             device="meta",
-            dtype=dtype,
         )
         self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.attn = Qwen3PagedAttention(
-            num_heads=self.total_num_heads,
+            num_heads=self.num_heads,
             head_dim=self.head_dim,
-            num_kv_heads=self.total_num_kv_heads,
+            num_kv_heads=self.num_kv_heads,
             backend=attn_backend,
         )
         self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
@@ -163,24 +213,31 @@ class Qwen3Attention(nn.Module):
 
 
 class Qwen3MLP(nn.Module):
-    """Qwen3 MLP shell using vLLM's packed gate_up projection naming."""
+    """Qwen3 MLP；对齐 vLLM ``Qwen2MLP`` 的 packed gate_up + down。
+
+    ``gate_up_proj`` 暂用 ``ColumnParallelLinear``（``MergedColumnParallelLinear``
+    后续替换）；``down_proj`` 为 ``RowParallelLinear``。
+    """
 
     def __init__(self, config: Qwen3Config) -> None:
         super().__init__()
         dtype = _param_dtype(config)
-        self.gate_up_proj = nn.Linear(
+        self.gate_up_proj = ColumnParallelLinearLayer(
             config.hidden_size,
             2 * config.intermediate_size,
             bias=False,
+            gather_output=False,
+            params_dtype=dtype,
             device="meta",
-            dtype=dtype,
         )
-        self.down_proj = nn.Linear(
+        self.down_proj = RowParallelLinearLayer(
             config.intermediate_size,
             config.hidden_size,
             bias=False,
+            input_is_parallel=True,
+            reduce_results=True,
+            params_dtype=dtype,
             device="meta",
-            dtype=dtype,
         )
         self.act_fn = nn.SiLU()
 
@@ -266,15 +323,17 @@ class Qwen3ForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.model = Qwen3Model(config, attn_backend=attn_backend)
+        # vLLM 用 ParallelLMHead；未实现前用 ColumnParallel 按 vocab 维切分占位
         self.lm_head = (
             self.model.embed_tokens
             if config.tie_word_embeddings
-            else nn.Linear(
+            else ColumnParallelLinearLayer(
                 config.hidden_size,
                 config.vocab_size,
                 bias=False,
+                gather_output=False,
+                params_dtype=_param_dtype(config),
                 device="meta",
-                dtype=_param_dtype(config),
             )
         )
         self.logits_processor = nn.Identity()

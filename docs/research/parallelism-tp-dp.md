@@ -245,9 +245,9 @@ lake 倾向（已有文档口径）：副本内 **一份调度决策 + 多卡执
 
 | 现单卡 | TP 版 |
 |--------|--------|
-| `nn.Linear`（qkv / o / gate_up / down） | `QKVParallelLinear` / `RowParallelLinear` / `MergedColumnParallelLinear` |
-| `nn.Embedding` / tied lm_head | `VocabParallelEmbedding` / `ParallelLMHead` + logits gather |
-| Attention 构造 | `num_heads`/`num_kv_heads` 按 `tp_size` 除；KV arena **按本地头数**编址 |
+| `nn.Linear`（qkv / o / gate_up / down） | **已换**：`ColumnParallel`（qkv/gate_up 占位）/ `RowParallel`（o/down）；待 `QKVParallelLinear` / `MergedColumnParallelLinear` |
+| `nn.Embedding` / tied lm_head | embed 仍 `nn.Embedding`；未 tie 的 `lm_head` 暂 `ColumnParallel`（待 `ParallelLMHead`） |
+| Attention 构造 | **已**：`num_heads`/`num_kv_heads` 按 `tp_size` 除；KV arena 按本地头数编址 |
 | Runner | 不按平台子类化；持 `tp_size`/`tp_rank`；构造期注入与 attn backend 同级 |
 
 ### 4.3 DP 最小集（副本）
