@@ -10,6 +10,7 @@ from transformers import Qwen3Config
 from lake.engine.agents.memory import InMemoryAgent
 from lake.engine.model_runner import ModelRunner
 from lake.engine.model_executor.models.loader import DummyModelLoader, get_model_loader
+from lake.engine.config import ParallelConfig
 
 from lake.engine.model_executor.models.qwen.qwen3 import (
     Qwen3ForCausalLM,
@@ -51,7 +52,9 @@ def test_qwen3_config_matches_dense_0_6b_shape() -> None:
 
 def test_dummy_model_loader_loads_qwen3() -> None:
     loader = DummyModelLoader()
-    model = loader.load_model(Qwen3ForCausalLM, QWEN3_0_6B_CONFIG)
+    model = loader.load_model(
+        Qwen3ForCausalLM, QWEN3_0_6B_CONFIG, parallel_config=ParallelConfig()
+    )
     assert model.loaded_dummy_weights is True
     assert "model.embed_tokens.weight" in model.loaded_weights
     assert "model.layers.0.self_attn.qkv_proj.weight" in model.loaded_weights
@@ -61,14 +64,16 @@ def test_dummy_model_loader_loads_qwen3() -> None:
 def test_default_model_loader_is_real_weight_boundary() -> None:
     loader = get_model_loader("hf", model_path=QWEN3_0_6B_MODEL_ID)
     try:
-        loader.load_model(Qwen3ForCausalLM, QWEN3_0_6B_CONFIG)
+        loader.load_model(
+            Qwen3ForCausalLM, QWEN3_0_6B_CONFIG, parallel_config=ParallelConfig()
+        )
         raise AssertionError("expected real weight loader to be pending")
     except NotImplementedError as e:
         assert "real weight loading" in str(e)
 
 
 def test_qwen3_load_weights_keeps_model_api_plain() -> None:
-    model = Qwen3ForCausalLM(QWEN3_0_6B_CONFIG)
+    model = Qwen3ForCausalLM(QWEN3_0_6B_CONFIG, parallel_config=ParallelConfig())
     assert hasattr(model, "training")
     assert model.model.config is QWEN3_0_6B_CONFIG
     assert len(model.model.layers) == QWEN3_0_6B_CONFIG.num_hidden_layers
@@ -90,7 +95,7 @@ def test_qwen3_module_tree_matches_vllm_packed_layout() -> None:
         RowParallelLinearLayer,
     )
 
-    model = Qwen3ForCausalLM(QWEN3_0_6B_CONFIG)
+    model = Qwen3ForCausalLM(QWEN3_0_6B_CONFIG, parallel_config=ParallelConfig())
     layer0 = model.model.layers[0]
     head_dim = QWEN3_0_6B_CONFIG.head_dim
     q_size = QWEN3_0_6B_CONFIG.num_attention_heads * head_dim
@@ -270,7 +275,11 @@ def test_qwen3_materialize_and_forward_produces_finite_logits() -> None:
     from lake.engine.model_executor.layers.attentions import build_attn_backend
     from lake.engine.model_executor.models.loader import materialize_model
 
-    model = Qwen3ForCausalLM(_tiny_qwen3_config(), attn_backend=build_attn_backend("cpu"))
+    model = Qwen3ForCausalLM(
+        _tiny_qwen3_config(),
+        attn_backend=build_attn_backend("cpu"),
+        parallel_config=ParallelConfig(),
+    )
     materialize_model(model, device="cpu", dtype=torch.float32)
     input_ids = torch.tensor([1, 2, 3, 4], dtype=torch.long)
     positions = torch.arange(4, dtype=torch.long)
@@ -288,7 +297,9 @@ def test_qwen3_forward_argmax_in_vocab_range() -> None:
     from lake.engine.model_executor.models.loader import materialize_model
 
     cfg = _tiny_qwen3_config()
-    model = Qwen3ForCausalLM(cfg, attn_backend=build_attn_backend("cpu"))
+    model = Qwen3ForCausalLM(
+        cfg, attn_backend=build_attn_backend("cpu"), parallel_config=ParallelConfig()
+    )
     materialize_model(model, device="cpu", dtype=torch.float32, seed=1)
     input_ids = torch.tensor([5, 6, 7], dtype=torch.long)
     positions = torch.arange(3, dtype=torch.long)
@@ -327,7 +338,9 @@ def test_qwen3_paged_forward_matches_nonpaged() -> None:
     from lake.engine.model_executor.layers.attentions import build_attn_backend
 
     cfg = _tiny_qwen3_config()
-    model = Qwen3ForCausalLM(cfg, attn_backend=build_attn_backend("cpu"))
+    model = Qwen3ForCausalLM(
+        cfg, attn_backend=build_attn_backend("cpu"), parallel_config=ParallelConfig()
+    )
     materialize_model(model, device="cpu", dtype=torch.float32, seed=3)
     num_layers = cfg.num_hidden_layers
     num_kv_heads = cfg.num_key_value_heads

@@ -151,6 +151,7 @@ class ModelRunner:
             load_format=load_format,
             config_override=self._config_override,
             attn_backend=self._attn_backend,
+            parallel_config=self._role.parallel,
         )
         self._model = loaded.model
         # C16a：dummy 路径物化 meta 权重到 cpu（小随机 init），使 forward 产真实 logits。

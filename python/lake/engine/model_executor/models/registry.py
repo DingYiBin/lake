@@ -14,6 +14,8 @@ from typing import Any
 
 from transformers import AutoConfig
 
+from lake.engine.config.parallel import ParallelConfig
+
 
 class _BaseRegisteredModel:
     def load_model_cls(self) -> type:
@@ -104,6 +106,7 @@ def load_registered_model(
     load_format: str = "dummy",
     config_override: Any | None = None,
     attn_backend: object | None = None,
+    parallel_config: ParallelConfig,
 ) -> LoadedModel:
     config = config_override or load_hf_config(model_path, revision)
     architectures = list(getattr(config, "architectures", None) or [])
@@ -112,7 +115,12 @@ def load_registered_model(
     from lake.engine.model_executor.models.loader import get_model_loader
 
     loader = get_model_loader(load_format, model_path=model_path, revision=revision)
-    model = loader.load_model(model_cls, config, attn_backend=attn_backend)
+    model = loader.load_model(
+        model_cls,
+        config,
+        attn_backend=attn_backend,
+        parallel_config=parallel_config,
+    )
     return LoadedModel(
         model_path=model_path,
         revision=revision,

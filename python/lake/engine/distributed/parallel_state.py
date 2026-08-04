@@ -200,6 +200,38 @@ def resolve_comm_group(
     )
 
 
+def tp_group_for_config(parallel_config: ParallelConfig) -> GroupCoordinator:
+    """模型构造用 TP 组视图：按 ``ParallelConfig`` 解析，而非读全局隐式状态。
+
+    - 全局 model-parallel 已 init 且 ``tp_size`` 与 config 匹配 → 复用真 TP 组
+      （含 ``device_group``，forward 时集体通信可用）。
+    - 否则 → 按 config 建无 PG 视图（``ranks=[0..tp_size)``、rank 取
+      ``resolve_rank``）：仅用于 meta 权重分片形状与 ``tp_rank`` 偏移；
+      真 TP>1 forward 的 all-reduce/all-gather 需先
+      ``ensure_model_parallel_initialized(config)`` 建真组。
+
+    让模型层并行模式由显式 ``ParallelConfig`` 驱动，对齐「config 注入优先于
+    全局状态」的边界；与 vLLM/SGLang 全局 parallel_state 的差异：lake 把
+    配置作为构造期权威，全局组只在真分布式 boot 时才接管。
+    """
+    if model_parallel_is_initialized():
+        tp = get_tp_group()
+        if tp.world_size != parallel_config.tensor_parallel_size:
+            raise RuntimeError(
+                f"global tp_size={tp.world_size} != "
+                f"ParallelConfig.tensor_parallel_size="
+                f"{parallel_config.tensor_parallel_size}"
+            )
+        return tp
+    rank = parallel_config.resolve_rank() if parallel_config.tensor_parallel_size > 1 else 0
+    return GroupCoordinator(
+        ranks=list(range(parallel_config.tensor_parallel_size)),
+        rank=rank,
+        local_rank=parallel_config.resolve_local_rank(),
+        group_name="tp-config",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Process-global state
 # ---------------------------------------------------------------------------

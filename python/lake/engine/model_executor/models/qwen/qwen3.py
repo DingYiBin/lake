@@ -19,7 +19,8 @@ import torch
 from torch import nn
 from transformers import Qwen3Config
 
-from lake.engine.distributed.parallel_state import resolve_comm_group
+from lake.engine.config.parallel import ParallelConfig
+from lake.engine.distributed.parallel_state import tp_group_for_config
 from lake.engine.model_executor.layers.linear import (
     ColumnParallelLinearLayer,
     MergedColumnParallelLinearLayer,
@@ -46,11 +47,6 @@ def _param_dtype(config: Qwen3Config) -> torch.dtype:
 
 def _head_dim(config: Qwen3Config) -> int:
     return int(getattr(config, "head_dim", config.hidden_size // config.num_attention_heads))
-
-
-def _tp_world_size() -> int:
-    """当前默认 TP 组大小（未 init parallel 时为 1）。"""
-    return resolve_comm_group(None).world_size
 
 
 class Qwen3RMSNorm(nn.Module):
@@ -192,7 +188,7 @@ class Qwen3Attention(nn.Module):
     ``RowParallelLinear``。本地 ``num_heads`` / ``num_kv_heads`` 按 TP 切分。
     """
 
-    def __init__(self, config: Qwen3Config, layer_idx: int, *, attn_backend: AttentionBackend | None = None) -> None:
+    def __init__(self, config: Qwen3Config, layer_idx: int, *, attn_backend: AttentionBackend | None = None, parallel_config: ParallelConfig) -> None:
         super().__init__()
         dtype = _param_dtype(config)
         self.config = config
@@ -203,7 +199,8 @@ class Qwen3Attention(nn.Module):
         self.head_dim = _head_dim(config)
         self.scaling = self.head_dim**-0.5
 
-        tp_size = _tp_world_size()
+        self.parallel_config = parallel_config
+        tp_size = self.parallel_config.tensor_parallel_size
         if self.total_num_heads % tp_size != 0:
             raise ValueError(
                 f"num_attention_heads={self.total_num_heads} not divisible by tp_size={tp_size}"
@@ -225,6 +222,9 @@ class Qwen3Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
 
+        # TP 通讯域：由 parallel_config 显式解析（见 tp_group_for_config），
+        # 不再读全局隐式状态——模型层并行模式由构造入参决定。
+        tp_pg = tp_group_for_config(self.parallel_config)
         # packed 总输出维；ColumnParallel 按 tp 切分。KV 复制场景下与真
         # QKVParallelLinear 的分片布局可能不一致——TP>1 且 total_kv < tp 时待专类。
         qkv_out = (
@@ -237,6 +237,7 @@ class Qwen3Attention(nn.Module):
             bias=bool(getattr(config, "attention_bias", False)),
             gather_output=False,
             params_dtype=dtype,
+            pg=tp_pg,
             device="meta",
         )
         self.o_proj = RowParallelLinearLayer(
@@ -246,6 +247,7 @@ class Qwen3Attention(nn.Module):
             input_is_parallel=True,
             reduce_results=True,
             params_dtype=dtype,
+            pg=tp_pg,
             device="meta",
         )
         self.rotary_emb = Qwen3RotaryEmbedding(config)
@@ -310,16 +312,18 @@ class Qwen3Attention(nn.Module):
 class Qwen3MLP(nn.Module):
     """Qwen3 MLP；对齐 vLLM ``Qwen2MLP`` 的 packed gate_up + down。"""
 
-    def __init__(self, config: Qwen3Config) -> None:
+    def __init__(self, config: Qwen3Config, *, parallel_config: ParallelConfig) -> None:
         super().__init__()
         dtype = _param_dtype(config)
         inter = config.intermediate_size
+        tp_pg = tp_group_for_config(parallel_config)
         self.gate_up_proj = MergedColumnParallelLinearLayer(
             config.hidden_size,
             [inter, inter],
             bias=False,
             gather_output=False,
             params_dtype=dtype,
+            pg=tp_pg,
             device="meta",
         )
         self.down_proj = RowParallelLinearLayer(
@@ -329,6 +333,7 @@ class Qwen3MLP(nn.Module):
             input_is_parallel=True,
             reduce_results=True,
             params_dtype=dtype,
+            pg=tp_pg,
             device="meta",
         )
         self.act_fn = nn.SiLU()
@@ -348,7 +353,7 @@ class Qwen3Model(nn.Module):
     lake 先钉住 module 边界和 config，真 attention/MLP 后续接 Torch/Triton。
     """
 
-    def __init__(self, config: Qwen3Config, *, attn_backend: AttentionBackend | None = None) -> None:
+    def __init__(self, config: Qwen3Config, *, attn_backend: AttentionBackend | None = None, parallel_config: ParallelConfig) -> None:
         super().__init__()
         dtype = _param_dtype(config)
         self.config = config
@@ -362,7 +367,12 @@ class Qwen3Model(nn.Module):
             dtype=dtype,
         )
         self.layers = nn.ModuleList(
-            Qwen3DecoderLayer(config, layer_idx=i, attn_backend=attn_backend)
+            Qwen3DecoderLayer(
+                config,
+                layer_idx=i,
+                attn_backend=attn_backend,
+                parallel_config=parallel_config,
+            )
             for i in range(config.num_hidden_layers)
         )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
@@ -389,14 +399,16 @@ class Qwen3Model(nn.Module):
 class Qwen3DecoderLayer(nn.Module):
     """Dense Qwen3 decoder layer placeholder with stable module identity."""
 
-    def __init__(self, config: Qwen3Config, layer_idx: int, *, attn_backend: AttentionBackend | None = None) -> None:
+    def __init__(self, config: Qwen3Config, layer_idx: int, *, attn_backend: AttentionBackend | None = None, parallel_config: ParallelConfig) -> None:
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
         dtype = _param_dtype(config)
         self.hidden_size = config.hidden_size
-        self.self_attn = Qwen3Attention(config, layer_idx, attn_backend=attn_backend)
-        self.mlp = Qwen3MLP(config)
+        self.self_attn = Qwen3Attention(
+            config, layer_idx, attn_backend=attn_backend, parallel_config=parallel_config
+        )
+        self.mlp = Qwen3MLP(config, parallel_config=parallel_config)
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps, dtype=dtype)
         self.post_attention_layernorm = Qwen3RMSNorm(
             config.hidden_size,
@@ -429,11 +441,15 @@ class Qwen3ForCausalLM(nn.Module):
     `load_weights(weights)`；dummy 由 loader 层处理。
     """
 
-    def __init__(self, config: Qwen3Config, *, attn_backend: AttentionBackend | None = None) -> None:
+    def __init__(self, config: Qwen3Config, *, attn_backend: AttentionBackend | None = None, parallel_config: ParallelConfig) -> None:
         super().__init__()
         self.config = config
-        self.model = Qwen3Model(config, attn_backend=attn_backend)
+        self.parallel_config = parallel_config
+        self.model = Qwen3Model(
+            config, attn_backend=attn_backend, parallel_config=parallel_config
+        )
         # vLLM 用 ParallelLMHead；未实现前用 ColumnParallel 按 vocab 维切分占位
+        tp_pg = tp_group_for_config(self.parallel_config)
         self.lm_head = (
             self.model.embed_tokens
             if config.tie_word_embeddings
@@ -443,6 +459,7 @@ class Qwen3ForCausalLM(nn.Module):
                 bias=False,
                 gather_output=False,
                 params_dtype=_param_dtype(config),
+                pg=tp_pg,
                 device="meta",
             )
         )

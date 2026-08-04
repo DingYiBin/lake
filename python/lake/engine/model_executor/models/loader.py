@@ -12,6 +12,8 @@ from typing import Generic, Literal, TypeVar
 import torch
 import torch.nn as nn
 
+from lake.engine.config.parallel import ParallelConfig
+
 
 TModel = TypeVar("TModel")
 TConfig = TypeVar("TConfig")
@@ -27,14 +29,18 @@ class BaseModelLoader(Generic[TModel, TConfig]):
         config: TConfig,
         *,
         attn_backend: object | None = None,
+        parallel_config: ParallelConfig,
     ) -> TModel:
-        # 仅当模型类接受 ``attn_backend`` 时注入（Qwen3ForCausalLM 接受；测试/自定义
-        # 模型可能不接受，回退到 ``model_cls(config)``）——对齐 vLLM 对可选构造 kwarg
-        # 的兼容处理，避免强制所有模型类改签名。
-        if "attn_backend" in inspect.signature(model_cls).parameters:
-            model = model_cls(config, attn_backend=attn_backend)
-        else:
-            model = model_cls(config)
+        # 仅当模型类接受对应 kwarg 时注入（Qwen3ForCausalLM 接受；测试/自定义
+        # 模型可能不接受，回退到 ``model_cls(config)``）——对齐 vLLM 对可选构造
+        # kwarg 的兼容处理，避免强制所有模型类改签名。
+        sig = inspect.signature(model_cls).parameters
+        kwargs: dict[str, object] = {}
+        if "attn_backend" in sig:
+            kwargs["attn_backend"] = attn_backend
+        if "parallel_config" in sig:
+            kwargs["parallel_config"] = parallel_config
+        model = model_cls(config, **kwargs)
         loaded = self.load_weights(model)
         if loaded is not None:
             setattr(model, "loaded_weights", loaded)
