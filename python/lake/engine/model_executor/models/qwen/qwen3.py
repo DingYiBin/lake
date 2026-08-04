@@ -1,9 +1,10 @@
 """Qwen3 model runtime skeleton.
 
 类名与 vLLM `Qwen3ForCausalLM` 对齐；config 由模型加载侧从 Hugging Face
-config 读取后传入。Linear 对齐 vLLM：``qkv_proj``/``gate_up_proj`` 用
-ColumnParallel（QKV/MergedColumn 专用类后续替换）、``o_proj``/``down_proj``
-用 RowParallel；``lm_head`` 未 tie 时用 ColumnParallel（占位 ParallelLMHead）。
+config 读取后传入。Linear 对齐 vLLM：``qkv_proj`` 暂用 ColumnParallel
+（``QKVParallelLinear`` 后续替换）、``gate_up_proj`` 用 MergedColumnParallel、
+``o_proj``/``down_proj`` 用 RowParallel；``lm_head`` 未 tie 时用 ColumnParallel
+（占位 ParallelLMHead）。
 
 本阶段经通用 `DummyModelLoader` 建立权重加载边界和 deterministic forward
 占位，不加载真实 safetensors。
@@ -21,6 +22,7 @@ from transformers import Qwen3Config
 from lake.engine.distributed.parallel_state import resolve_comm_group
 from lake.engine.model_executor.layers.linear import (
     ColumnParallelLinearLayer,
+    MergedColumnParallelLinearLayer,
     RowParallelLinearLayer,
 )
 
@@ -213,25 +215,22 @@ class Qwen3Attention(nn.Module):
 
 
 class Qwen3MLP(nn.Module):
-    """Qwen3 MLP；对齐 vLLM ``Qwen2MLP`` 的 packed gate_up + down。
-
-    ``gate_up_proj`` 暂用 ``ColumnParallelLinear``（``MergedColumnParallelLinear``
-    后续替换）；``down_proj`` 为 ``RowParallelLinear``。
-    """
+    """Qwen3 MLP；对齐 vLLM ``Qwen2MLP`` 的 packed gate_up + down。"""
 
     def __init__(self, config: Qwen3Config) -> None:
         super().__init__()
         dtype = _param_dtype(config)
-        self.gate_up_proj = ColumnParallelLinearLayer(
+        inter = config.intermediate_size
+        self.gate_up_proj = MergedColumnParallelLinearLayer(
             config.hidden_size,
-            2 * config.intermediate_size,
+            [inter, inter],
             bias=False,
             gather_output=False,
             params_dtype=dtype,
             device="meta",
         )
         self.down_proj = RowParallelLinearLayer(
-            config.intermediate_size,
+            inter,
             config.hidden_size,
             bias=False,
             input_is_parallel=True,

@@ -13,6 +13,7 @@ from lake.engine.distributed.parallel_state import (
 from lake.engine.config import ParallelConfig
 from lake.engine.model_executor.layers.linear import (
     ColumnParallelLinearLayer,
+    MergedColumnParallelLinearLayer,
     ReplicatedLinearLayer,
     RowParallelLinearLayer,
     divide,
@@ -112,6 +113,34 @@ def test_disable_tp_ignores_group_size() -> None:
     col = ColumnParallelLinearLayer(8, 16, bias=False, pg=custom, disable_tp=True)
     assert col.tp_size == 1
     assert col.weight.shape == (16, 8)
+
+
+def test_merged_column_loads_per_shard_and_fused() -> None:
+    """TP=2：各段分别切分后拼接，≠ 对 fused 权重做 contiguous TP 切。"""
+    g0 = _fake_tp_group(0, 2)
+    g1 = _fake_tp_group(1, 2)
+    m0 = MergedColumnParallelLinearLayer(4, [4, 4], bias=False, pg=g0)
+    m1 = MergedColumnParallelLinearLayer(4, [4, 4], bias=False, pg=g1)
+    assert m0.weight.shape == (4, 4)  # (4/2 + 4/2, in)
+    assert m0.output_partition_sizes == [2, 2]
+
+    gate = torch.arange(4 * 4, dtype=torch.float32).reshape(4, 4)
+    up = torch.arange(100, 100 + 4 * 4, dtype=torch.float32).reshape(4, 4)
+    m0.weight_loader(m0.weight, gate, loaded_shard_id=0)
+    m0.weight_loader(m0.weight, up, loaded_shard_id=1)
+    m1.weight_loader(m1.weight, gate, loaded_shard_id=0)
+    m1.weight_loader(m1.weight, up, loaded_shard_id=1)
+
+    # rank0: gate[:2] || up[:2]；rank1: gate[2:] || up[2:]
+    assert torch.equal(m0.weight[:2], gate[:2])
+    assert torch.equal(m0.weight[2:], up[:2])
+    assert torch.equal(m1.weight[:2], gate[2:])
+    assert torch.equal(m1.weight[2:], up[2:])
+
+    fused = torch.cat([gate, up], dim=0)
+    m0b = MergedColumnParallelLinearLayer(4, [4, 4], bias=False, pg=g0)
+    m0b.weight_loader(m0b.weight, fused)  # shard_id=None → 按段拆
+    assert torch.equal(m0b.weight, m0.weight)
 
 
 def test_replicated_full_weight_no_shard() -> None:

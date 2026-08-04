@@ -2,6 +2,8 @@ from lake.engine.model_executor.layers.attentions import AttentionMetadata, buil
 from lake.engine.model_executor.layers.linear import (
     ColumnParallelLinear,
     ColumnParallelLinearLayer,
+    MergedColumnParallelLinear,
+    MergedColumnParallelLinearLayer,
     ReplicatedLinear,
     ReplicatedLinearLayer,
     RowParallelLinear,
@@ -15,6 +17,8 @@ __all__ = [
     "ColumnParallelLinearLayer",
     "CpuAttentionBackend",
     "FlashAttn2Backend",
+    "MergedColumnParallelLinear",
+    "MergedColumnParallelLinearLayer",
     "RefAttentionBackend",
     "ReplicatedLinear",
     "ReplicatedLinearLayer",

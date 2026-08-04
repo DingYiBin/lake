@@ -84,6 +84,7 @@ def test_qwen3_load_weights_keeps_model_api_plain() -> None:
 def test_qwen3_module_tree_matches_vllm_packed_layout() -> None:
     from lake.engine.model_executor.layers.linear import (
         ColumnParallelLinearLayer,
+        MergedColumnParallelLinearLayer,
         RowParallelLinearLayer,
     )
 
@@ -99,7 +100,11 @@ def test_qwen3_module_tree_matches_vllm_packed_layout() -> None:
     )
     assert isinstance(layer0.self_attn.qkv_proj, ColumnParallelLinearLayer)
     assert isinstance(layer0.self_attn.o_proj, RowParallelLinearLayer)
-    assert isinstance(layer0.mlp.gate_up_proj, ColumnParallelLinearLayer)
+    assert isinstance(layer0.mlp.gate_up_proj, MergedColumnParallelLinearLayer)
+    assert layer0.mlp.gate_up_proj.output_sizes == [
+        QWEN3_0_6B_CONFIG.intermediate_size,
+        QWEN3_0_6B_CONFIG.intermediate_size,
+    ]
     assert isinstance(layer0.mlp.down_proj, RowParallelLinearLayer)
     assert layer0.self_attn.qkv_proj.weight.shape == (
         q_size + (2 * kv_size),

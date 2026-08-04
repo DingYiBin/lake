@@ -245,7 +245,7 @@ lake 倾向（已有文档口径）：副本内 **一份调度决策 + 多卡执
 
 | 现单卡 | TP 版 |
 |--------|--------|
-| `nn.Linear`（qkv / o / gate_up / down） | **已换**：`ColumnParallel`（qkv/gate_up 占位）/ `RowParallel`（o/down）；待 `QKVParallelLinear` / `MergedColumnParallelLinear` |
+| `nn.Linear`（qkv / o / gate_up / down） | **已换**：`ColumnParallel`（qkv 占位）/ `MergedColumnParallel`（gate_up）/ `RowParallel`（o/down）；待 `QKVParallelLinear` |
 | `nn.Embedding` / tied lm_head | embed 仍 `nn.Embedding`；未 tie 的 `lm_head` 暂 `ColumnParallel`（待 `ParallelLMHead`） |
 | Attention 构造 | **已**：`num_heads`/`num_kv_heads` 按 `tp_size` 除；KV arena 按本地头数编址 |
 | Runner | 不按平台子类化；持 `tp_size`/`tp_rank`；构造期注入与 attn backend 同级 |
@@ -278,12 +278,12 @@ lake 倾向（已有文档口径）：副本内 **一份调度决策 + 多卡执
 | mesh 切组 | `python/lake/engine/distributed/parallel_state.py::{tp,pp,dp}_group_ranks` / `initialize_model_parallel` | 与 vLLM reshape 同序（PCP=1） |
 | 组对象 | `…/parallel_state.py::GroupCoordinator` | ranks + `all_reduce`/`all_gather`（有 `device_group` 时）；custom AR 未挂 |
 | 通讯封装 | `…/communication_op.py` | 可传 `group`；默认 TP |
-| 并行 Linear | `python/lake/engine/model_executor/layers/linear/`（一类一文件） | `Column`/`Row` 可 `pg=`（默认 TP）；`Replicated` 全复制、无集体通信 |
+| 并行 Linear | `python/lake/engine/model_executor/layers/linear/`（一类一文件） | `Column`/`MergedColumn`/`Row` 可 `pg=`；`Replicated` 无集体通信 |
 | 进程挂点 | `RoleConfig.parallel`；`WorkerEngine.start` → `ensure_model_parallel_initialized` | 单卡跳过 dist；多卡需先 `init_distributed_environment` |
 
 **与 vLLM 差异（linear）**：vLLM 的 Column/Row **硬编码** `get_tp_group()`（经 `communication_op`）；lake 允许 `pg: GroupCoordinator | None`。`ReplicatedLinear` 与 vLLM 同：不使用通讯域。包路径按类拆分（vLLM 仍单文件 `linear.py`）。
 
-**未做**：NCCL/custom AR、QKV/MergedColumn、多进程 launcher、Router↔DP rank 头。
+**未做**：NCCL/custom AR、`QKVParallelLinear`、多进程 launcher、Router↔DP rank 头。
 
 ---
 
