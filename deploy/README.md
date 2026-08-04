@@ -52,7 +52,7 @@ curl → Go Router (:8080)
 ```bash
 curl -sS http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"mock-llm","messages":[{"role":"user","content":"hi"}],"max_tokens":4}'
+  -d '{"model":"tiny-llm","messages":[{"role":"user","content":"hi"}],"max_tokens":4}'
 ```
 
 响应 JSON 含 `lake.reused_blocks` / `lake.prefill_blocks` / `lake.mode`（P3 固定 `COLOCATED`）。

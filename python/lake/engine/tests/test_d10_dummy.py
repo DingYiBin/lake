@@ -2,19 +2,13 @@
 
 from __future__ import annotations
 
-import os
-
 from lake.engine.agents.memory import InMemoryAgent
-from lake.engine.model_runner import ModelLoadInfo, ModelRunner
+from lake.engine.model_runner import ModelLoadInfo
 from lake.engine.pool_iface import PoolIface
 from lake.engine.pool_types import PreparePlan
 from lake.runtime.req import Req
 from lake.runtime.scheduler_output import ForwardMode, ReqIoSet, SamplingParams, SchedulerOutput
-
-
-QWEN3_0_6B_MODEL_ID = os.path.expanduser(
-    os.environ.get("LAKE_TEST_QWEN3_MODEL_PATH", "Qwen/Qwen3-0.6B")
-)
+from lake.testing import make_runner
 
 
 def test_commit_does_not_undercut_newer_prepare() -> None:
@@ -62,8 +56,7 @@ def test_commit_shrinks_when_no_newer_prepare() -> None:
 def test_dummy_run_skips_pool_done() -> None:
     ag = InMemoryAgent()
     pool = PoolIface(ag)
-    runner = ModelRunner(pool, model_backend="mock")
-    runner.load_model()
+    runner = make_runner(pool)
     out = runner.dummy_run(num_reqs=2, tokens_per_req=3, step_id=42)
     assert out.step_id == 42
     assert ag.done_calls == 0
@@ -71,20 +64,20 @@ def test_dummy_run_skips_pool_done() -> None:
     assert runner._input_batch.req_ids == ["dummy-0", "dummy-1"]  # noqa: SLF001
     assert runner._attn_meta is not None  # noqa: SLF001
     assert runner._attn_meta.num_actual_tokens == 2  # noqa: SLF001
-    assert out.next_token_ids == {"dummy-0": [0], "dummy-1": [0]}
+    assert out.next_token_ids == {"dummy-0": [6], "dummy-1": [6]}
 
 
 def test_extend_process_consumes_prepare_commit_guard() -> None:
     ag = InMemoryAgent()
     pool = PoolIface(ag)
-    runner = ModelRunner(pool, model_backend="mock")
+    runner = make_runner(pool)
     from lake.runtime.node_scheduler import NodeScheduler, build_req_from_generate
     from lake.runtime.role import RoleConfig
 
     sched = NodeScheduler(
         pool,
         runner,
-        RoleConfig(model_backend="mock", enable_overlap=False, max_num_scheduled_tokens=8),
+        RoleConfig(enable_overlap=False, max_num_scheduled_tokens=8),
     )
     sched.add_request(build_req_from_generate("r", "m", list(range(8)), 2, "n0"))
 
@@ -99,7 +92,7 @@ def test_extend_process_consumes_prepare_commit_guard() -> None:
 def test_dummy_run_requires_loaded_model() -> None:
     ag = InMemoryAgent()
     pool = PoolIface(ag)
-    runner = ModelRunner(pool, model_backend="mock")
+    runner = make_runner(pool, load=False)
     try:
         runner.dummy_run(num_reqs=1, tokens_per_req=1)
         raise AssertionError("expected unloaded model")
@@ -110,7 +103,7 @@ def test_dummy_run_requires_loaded_model() -> None:
 def test_execute_model_does_not_done_failed_step() -> None:
     ag = InMemoryAgent()
     pool = PoolIface(ag)
-    runner = ModelRunner(pool, model_backend="mock")
+    runner = make_runner(pool)
     req = Req(
         req_id="bad-ready",
         served_model_name="model",
@@ -142,29 +135,30 @@ def test_load_qwen3_model_pins_weights_and_warmup_skips_pool() -> None:
     ag = InMemoryAgent()
     pool = PoolIface(ag)
     pins: list[ModelLoadInfo] = []
-    runner = ModelRunner(
+    runner = make_runner(
         pool,
-        model_backend="qwen3",
+        load=False,
         weight_pin_callback=pins.append,
     )
-    info = runner.load_model(model_path=QWEN3_0_6B_MODEL_ID)
-    assert info.model_path == QWEN3_0_6B_MODEL_ID
+    info = runner.load_model(model_path="tiny-qwen3")
+    assert info.model_path == "tiny-qwen3"
     assert info.served_model_name == "model"
     assert info.revision == ""
-    assert info.backend == "qwen3"
+    assert info.architecture == "Qwen3ForCausalLM"
     assert info.load_dummy_weights is True
     assert info.weight_pinned is True
     assert pins == [info]
     assert runner.model_loaded is True
     assert runner.model_warmed is False
     assert runner._model is not None  # noqa: SLF001
-    assert runner._model.config.num_hidden_layers == 28  # noqa: SLF001
-    assert runner._model.config.num_key_value_heads == 8  # noqa: SLF001
+    assert runner._model.config.num_hidden_layers == 1  # noqa: SLF001
+    assert runner._model.config.num_key_value_heads == 2  # noqa: SLF001
 
     out = runner.warmup(num_reqs=2, tokens_per_req=1)
     assert out.step_id == -1
     assert runner.model_warmed is True
     assert ag.done_calls == 0
     assert ag.prepare_calls == 0
-    assert runner.status().model_path == QWEN3_0_6B_MODEL_ID
+    assert runner.status().model_path == "tiny-qwen3"
     assert runner.status().served_model_name == "model"
+    assert runner.status().architecture == "Qwen3ForCausalLM"

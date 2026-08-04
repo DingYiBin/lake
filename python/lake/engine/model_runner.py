@@ -24,12 +24,13 @@ from lake.engine.sample.grammar import apply_token_bitmask
 from lake.runtime.req import Req
 from lake.runtime.scheduler_output import ForwardMode, SamplingParams, SchedulerOutput
 
+
 @dataclass
 class ModelRunnerOutput:
     step_id: int
     next_token_ids: Dict[str, List[int]] = field(default_factory=dict)
     next_draft_tokens: Dict[str, List[int]] = field(default_factory=dict)
-    model_backend: str = "qwen3"
+    architecture: str = ""
 
 
 @dataclass(frozen=True)
@@ -37,7 +38,7 @@ class ModelLoadInfo:
     model_path: str
     served_model_name: str
     revision: str
-    backend: str
+    architecture: str
     load_format: str = "dummy"
     load_dummy_weights: bool = False
     weight_pinned: bool = False
@@ -48,7 +49,7 @@ class ModelRunnerStatus:
     model_path: str
     served_model_name: str
     revision: str
-    backend: str
+    architecture: str
     loaded: bool
     warmed: bool
 
@@ -58,7 +59,6 @@ class ModelRunner:
         self,
         pool: PoolIface,
         *,
-        model_backend: str = "qwen3",
         attn_backend_name: str = "cpu",
         model_config: Optional[Any] = None,
         weight_pin_callback: Optional[Callable[[ModelLoadInfo], None]] = None,
@@ -67,13 +67,13 @@ class ModelRunner:
         self._input_batch = InputBatch()
         self._input_buffers = InputBuffers(max_num_reqs=64, max_num_tokens=8192)
         self._attn_meta: Optional[AttentionMetadata] = None
-        self.model_backend = model_backend
         # attention 后端实例：runner 经注册表 ``build_attn_backend`` 建一次，沿模型树
         # 构造期注入到每个 ``Qwen3PagedAttention``——模型层不 import 任何具体后端
         # （对齐 vLLM ``Attention``/SGLang ``RadixAttention``：后端由 runner 选定注入）。
         self._attn_backend = build_attn_backend(attn_backend_name)
         self._config_override = model_config
         self._model: Optional[Any] = None
+        self._architecture = ""
         self._weight_pin_callback = weight_pin_callback
         self._model_path = ""
         self._served_model_name = "model"
@@ -97,12 +97,16 @@ class ModelRunner:
     def served_model_name(self) -> str:
         return self._served_model_name
 
+    @property
+    def architecture(self) -> str:
+        return self._architecture
+
     def status(self) -> ModelRunnerStatus:
         return ModelRunnerStatus(
             model_path=self._model_path,
             served_model_name=self._served_model_name,
             revision=self._model_revision,
-            backend=self.model_backend,
+            architecture=self._architecture,
             loaded=self._model_loaded,
             warmed=self._model_warmed,
         )
@@ -120,29 +124,12 @@ class ModelRunner:
         """C12：真实模型加载骨架。
 
         对齐 vLLM `GPUModelRunner.load_model` 的阶段边界：先建立模型对象，
-        再初始化依赖模型的执行组件。lake 只记录状态并触发权重 pin 回调；
-        权重所有权仍归存储池。
+        再初始化依赖模型的执行组件。选模走 HF ``config.architectures`` → registry
+        （未注册 raise）；``load_format=dummy`` 跳过权重下载（对齐 vLLM/SGLang
+        ``DummyModelLoader``）。权重所有权仍归存储池。
         """
 
-        if self.model_backend == "mock":
-            self._model = None
-            self._model_path = model_path
-            self._served_model_name = served_model_name or "model"
-            self._model_revision = revision
-            self._model_loaded = True
-            self._model_warmed = False
-            return ModelLoadInfo(
-                model_path=self._model_path,
-                served_model_name=self._served_model_name,
-                revision=self._model_revision,
-                backend=self.model_backend,
-                load_format=load_format,
-                load_dummy_weights=load_dummy_weights,
-                weight_pinned=pin_weights,
-            )
-
         loaded = load_registered_model(
-            backend=self.model_backend,
             model_path=model_path,
             revision=revision,
             load_format=load_format,
@@ -150,6 +137,7 @@ class ModelRunner:
             attn_backend=self._attn_backend,
         )
         self._model = loaded.model
+        self._architecture = loaded.architecture
         self._model_path = loaded.model_path
         self._served_model_name = served_model_name or "model"
         self._model_revision = loaded.revision
@@ -159,7 +147,7 @@ class ModelRunner:
             model_path=self._model_path,
             served_model_name=self._served_model_name,
             revision=self._model_revision,
-            backend=self.model_backend,
+            architecture=self._architecture,
             load_format=loaded.load_format,
             load_dummy_weights=load_dummy_weights or loaded.load_dummy_weights,
             weight_pinned=pin_weights,
@@ -308,28 +296,18 @@ class ModelRunner:
         由 NodeScheduler/RuntimeExecutor 边界统一收口，runner 不 ack pool。
         """
 
-        next_tokens: Dict[str, List[int]] = {}
-        next_drafts: Dict[str, List[int]] = {}
+        if self._model is None:
+            raise RuntimeError("model must be loaded before execute")
 
         batch = self.prepare_inputs(output, host)
         _meta = self.prepare_attn(batch, ready)
-        if self.model_backend == "qwen3":
-            next_tokens, next_drafts = self._forward_model(output, host, batch)
-        else:
-            for req_id, n in output.num_scheduled_tokens.items():
-                if n <= 0:
-                    continue
-                req = host.get(req_id)
-                if req is None:
-                    continue
-                if not batch.is_prompt_phase.get(req_id, False):
-                    next_tokens[req_id] = [0]
+        next_tokens, next_drafts = self._forward_model(output, host, batch)
 
         return ModelRunnerOutput(
             step_id=output.step_id,
             next_token_ids=next_tokens,
             next_draft_tokens=next_drafts,
-            model_backend=self.model_backend,
+            architecture=self._architecture,
         )
 
     def _forward_model(

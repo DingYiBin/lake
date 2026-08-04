@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from typing import Dict, List, Tuple
 
-from lake.engine.model_runner import ModelRunner
 from lake.engine.pool_iface import ReadyHandle, StepStats
 from lake.runtime.node_scheduler import NodeScheduler, build_req_from_generate
 from lake.runtime.role import RoleConfig
 from lake.runtime.scheduler_output import ForwardMode, SchedulerOutput
+from lake.testing import make_runner
 
 
 class FakePool:
@@ -38,13 +38,12 @@ class FakePool:
 
 def _make(role: RoleConfig) -> Tuple[NodeScheduler, FakePool]:
     pool = FakePool()
-    runner = ModelRunner(pool, model_backend=role.model_backend)  # type: ignore[arg-type]
+    runner = make_runner(pool)
     return NodeScheduler(pool, runner, role), pool  # type: ignore[arg-type]
 
 
 def test_chunked_extend_advances_computed() -> None:
     role = RoleConfig(
-        model_backend="mock",
         enable_overlap=False,
         long_prefill_token_threshold=4,
         max_num_scheduled_tokens=64,
@@ -63,7 +62,6 @@ def test_chunked_extend_advances_computed() -> None:
 def test_token_budget_caps_batch() -> None:
     """两请求各需 8 token extend；budget=8 → 同步只能调度其一（或合计≤8）。"""
     role = RoleConfig(
-        model_backend="mock",
         enable_overlap=False,
         max_num_scheduled_tokens=8,
         long_prefill_token_threshold=0,
@@ -88,7 +86,6 @@ def test_token_budget_caps_batch() -> None:
 def test_decode_priority_over_extend() -> None:
     """running 里已有 decode 时，先占预算做 decode，再用剩余预算 chunk extend。"""
     role = RoleConfig(
-        model_backend="mock",
         enable_overlap=False,
         max_num_scheduled_tokens=4,
         long_prefill_token_threshold=0,
@@ -113,7 +110,6 @@ def test_decode_priority_over_extend() -> None:
 
 def test_decode_read_write_sets_target_query_token() -> None:
     role = RoleConfig(
-        model_backend="mock",
         enable_overlap=False,
         max_num_scheduled_tokens=4,
     )
@@ -133,7 +129,6 @@ def test_decode_read_write_sets_target_query_token() -> None:
 
 def test_decode_query_geometry_includes_inflight_overlap() -> None:
     role = RoleConfig(
-        model_backend="mock",
         enable_overlap=True,
         max_num_scheduled_tokens=4,
     )
@@ -152,7 +147,7 @@ def test_decode_query_geometry_includes_inflight_overlap() -> None:
 
 
 def test_admission_rejects_over_max_model_length() -> None:
-    role = RoleConfig(max_model_length=10, model_backend="mock")
+    role = RoleConfig(max_model_length=10)
     sched, _ = _make(role)
     try:
         sched.add_request(build_req_from_generate("x", "m", list(range(8)), 5, "n0"))

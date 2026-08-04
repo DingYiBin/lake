@@ -13,8 +13,9 @@ export LAKE_WORKER_BIND="${LAKE_WORKER_BIND:-[::]:50053}"
 export LAKE_WORKER_ADDR="${LAKE_WORKER_ADDR:-127.0.0.1:50053}"
 export LAKE_AGENT_ADDR="${LAKE_AGENT_ADDR:-127.0.0.1:50054}"
 export LAKE_HTTP_ADDR="${LAKE_HTTP_ADDR:-:8080}"
-export LAKE_MODEL_BACKEND="${LAKE_MODEL_BACKEND:-mock}"
-export LAKE_SERVED_MODEL_NAME="${LAKE_SERVED_MODEL_NAME:-mock-llm}"
+# 选模走 HF config.architectures → registry；默认用仓库内 tiny config + load_format=dummy
+export LAKE_MODEL_PATH="${LAKE_MODEL_PATH:-$ROOT/testdata/tiny-qwen3}"
+export LAKE_SERVED_MODEL_NAME="${LAKE_SERVED_MODEL_NAME:-tiny-llm}"
 
 # 兼容 CARGO_TARGET_DIR 覆盖(如 CI/sandbox);不要写死 rust/target/debug。
 RUST_DEBUG="$(

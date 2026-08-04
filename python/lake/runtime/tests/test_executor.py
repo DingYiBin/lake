@@ -5,13 +5,14 @@ from __future__ import annotations
 from typing import Dict, List
 
 from lake.engine.agents.memory import InMemoryAgent
-from lake.engine.model_runner import ModelRunner, ModelRunnerOutput
+from lake.engine.model_runner import ModelRunnerOutput
 from lake.engine.pool_iface import PoolIface, ReadyHandle, StepStats
 from lake.runtime.executor import ExecutorInput, SingleProcessExecutor
 from lake.runtime.node_scheduler import NodeScheduler, build_req_from_generate
 from lake.runtime.role import RoleConfig
 from lake.runtime.scheduler_output import ForwardMode, ReqIoSet, SchedulerOutput
 from lake.runtime.worker_engine import WorkerEngine
+from lake.testing import make_runner
 
 
 class FakePool:
@@ -46,7 +47,15 @@ class RecordingExecutor:
 
     def execute_model(self, inp: ExecutorInput) -> ModelRunnerOutput:
         self.inputs.append(inp)
-        return ModelRunnerOutput(step_id=inp.output.step_id)
+        # 无真实 runner 时仍须产出 decode token，否则请求无法 finish
+        tokens: Dict[str, List[int]] = {}
+        for rid, n in inp.output.num_scheduled_tokens.items():
+            if n <= 0:
+                continue
+            mode = inp.output.req_forward_modes.get(rid, inp.output.forward_mode)
+            if mode != ForwardMode.EXTEND:
+                tokens[rid] = [0]
+        return ModelRunnerOutput(step_id=inp.output.step_id, next_token_ids=tokens)
 
 
 class FailingExecutor:
@@ -61,7 +70,7 @@ def test_single_process_executor_calls_runner() -> None:
 
         def execute_model(self, output, ready, host_reqs):
             self.calls.append(ExecutorInput(output=output, ready=ready, host_reqs=host_reqs))
-            return ModelRunnerOutput(step_id=output.step_id, model_backend="fake")
+            return ModelRunnerOutput(step_id=output.step_id, architecture="fake")
 
     runner = FakeRunner()
     executor = SingleProcessExecutor(runner)  # type: ignore[arg-type]
@@ -74,9 +83,9 @@ def test_single_process_executor_calls_runner() -> None:
 
 def test_node_scheduler_uses_executor() -> None:
     pool = FakePool()
-    runner = ModelRunner(pool, model_backend="mock")  # type: ignore[arg-type]
+    runner = make_runner(pool)
     executor = RecordingExecutor()
-    role = RoleConfig(model_backend="mock", enable_overlap=False)
+    role = RoleConfig(enable_overlap=False)
     sched = NodeScheduler(pool, runner, role, executor=executor)  # type: ignore[arg-type]
     sched.add_request(build_req_from_generate("r1", "m", list(range(4)), 1, "n0"))
 
@@ -91,8 +100,8 @@ def test_node_scheduler_uses_executor() -> None:
 
 def test_node_scheduler_done_on_executor_exception() -> None:
     pool = FakePool()
-    runner = ModelRunner(pool, model_backend="mock")  # type: ignore[arg-type]
-    role = RoleConfig(model_backend="mock", enable_overlap=False)
+    runner = make_runner(pool)
+    role = RoleConfig(enable_overlap=False)
     sched = NodeScheduler(pool, runner, role, executor=FailingExecutor())  # type: ignore[arg-type]
     sched.add_request(build_req_from_generate("r-boom", "m", list(range(4)), 1, "n0"))
     output = sched.schedule()
@@ -113,8 +122,8 @@ def test_node_scheduler_done_when_effective_set_filter_fails() -> None:
 
     ag = InMemoryAgent()
     pool = PoolIface(ag)
-    runner = ModelRunner(pool, model_backend="mock")
-    role = RoleConfig(model_backend="mock", enable_overlap=False)
+    runner = make_runner(pool)
+    role = RoleConfig(enable_overlap=False)
     sched = BadFilterScheduler(pool, runner, role)
     req = build_req_from_generate("r-filter", "m", list(range(4)), 1, "n0")
     sched.add_request(req)
@@ -142,9 +151,11 @@ def test_node_scheduler_done_when_effective_set_filter_fails() -> None:
 
 def test_worker_engine_wires_executor() -> None:
     pool = FakePool()
-    runner = ModelRunner(pool, model_backend="mock")  # type: ignore[arg-type]
+    runner = make_runner(pool, load=False)
     executor = RecordingExecutor()
-    role = RoleConfig(model_backend="mock", enable_overlap=False)
+    role = RoleConfig(enable_overlap=False, model_path="tiny-qwen3")
+    # start() 会再 load；config_override 已在 make_runner(load=False) 里挂上
+    assert runner._config_override is not None  # noqa: SLF001
     eng = WorkerEngine(pool, runner, role, coalesce_s=0, executor=executor)  # type: ignore[arg-type]
     eng.start()
     try:
@@ -153,11 +164,3 @@ def test_worker_engine_wires_executor() -> None:
         assert executor.inputs
     finally:
         eng.stop()
-
-
-if __name__ == "__main__":
-    test_single_process_executor_calls_runner()
-    test_node_scheduler_uses_executor()
-    test_node_scheduler_done_on_executor_exception()
-    test_worker_engine_wires_executor()
-    print("test_executor OK")

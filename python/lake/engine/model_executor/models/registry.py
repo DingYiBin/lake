@@ -42,7 +42,7 @@ class _LazyRegisteredModel(_BaseRegisteredModel):
 class LoadedModel:
     model_path: str
     revision: str
-    backend: str
+    architecture: str
     load_format: str = "dummy"
     config: Any | None = None
     model: object | None = None
@@ -99,7 +99,6 @@ def load_hf_config(model_path: str, revision: str = "") -> Any:
 
 def load_registered_model(
     *,
-    backend: str,
     model_path: str,
     revision: str = "",
     load_format: str = "dummy",
@@ -108,7 +107,7 @@ def load_registered_model(
 ) -> LoadedModel:
     config = config_override or load_hf_config(model_path, revision)
     architectures = list(getattr(config, "architectures", None) or [])
-    model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
+    model_cls, architecture = ModelRegistry.resolve_model_cls(architectures)
 
     from lake.engine.model_executor.models.loader import get_model_loader
 
@@ -117,7 +116,7 @@ def load_registered_model(
     return LoadedModel(
         model_path=model_path,
         revision=revision,
-        backend=backend,
+        architecture=architecture,
         load_format=load_format,
         config=config,
         model=model,

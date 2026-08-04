@@ -79,7 +79,6 @@ class WorkerServicer(lake_pb2_grpc.WorkerServiceServicer):
         )
         self._runner = ModelRunner(
             self._pool,
-            model_backend=self._role.model_backend,
             attn_backend_name=self._role.attn_backend_name,
         )
         self._engine = WorkerEngine(self._pool, self._runner, self._role)
@@ -140,12 +139,12 @@ def serve(bind: str, cp_addr: str, kv_addr: str) -> None:
     server.add_insecure_port(bind)
     server.start()
     LOG.info(
-        "WorkerService on %s (cp=%s kv=%s) role=%s backend=%s via WorkerEngine",
+        "WorkerService on %s (cp=%s kv=%s) role=%s model_path=%s via WorkerEngine",
         bind,
         cp_addr,
         kv_addr,
         role.role.value,
-        role.model_backend,
+        role.model_path or "(unset)",
     )
     try:
         server.wait_for_termination()

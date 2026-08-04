@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from lake.engine.agents.memory import InMemoryAgent
-from lake.engine.model_runner import ModelRunner
 from lake.engine.pool_iface import PoolIface
 from lake.engine.sample.grammar import apply_token_bitmask
 from lake.engine.sample.greedy import greedy_sample
 from lake.runtime.req import Req
 from lake.runtime.scheduler_output import ForwardMode, GrammarOutput, SamplingParams, SchedulerOutput
+from lake.testing import make_runner
 
 
 def test_greedy_sample() -> None:
@@ -23,7 +23,7 @@ def test_apply_token_bitmask() -> None:
 def test_sample_tokens_uses_grammar_bitmask() -> None:
     ag = InMemoryAgent()
     pool = PoolIface(ag)
-    runner = ModelRunner(pool, model_backend="mock")
+    runner = make_runner(pool, load=False)
     req = Req(
         req_id="g1",
         served_model_name="model",
@@ -48,7 +48,7 @@ def test_sample_tokens_uses_grammar_bitmask() -> None:
 def test_sample_tokens_can_defer_structured_output() -> None:
     ag = InMemoryAgent()
     pool = PoolIface(ag)
-    runner = ModelRunner(pool, model_backend="mock")
+    runner = make_runner(pool, load=False)
     req = Req(
         req_id="g2",
         served_model_name="model",

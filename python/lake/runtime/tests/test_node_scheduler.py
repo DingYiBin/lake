@@ -1,14 +1,18 @@
-"""C0/C1：node_scheduler continuous batching + overlap 冒烟（Fake pool）。"""
+"""C0/C1：node_scheduler continuous batching + overlap 冒烟（Fake pool）。
+
+模型走 ``load_format=dummy`` + tiny config（对齐 vLLM/SGLang），无 mock backend。
+"""
 
 from __future__ import annotations
 
 from typing import Dict, List, Tuple
 
-from lake.engine.model_runner import ModelRunner, ModelRunnerOutput
+from lake.engine.model_runner import ModelRunnerOutput
 from lake.engine.pool_iface import ReadyHandle, StepStats
 from lake.runtime.node_scheduler import NodeScheduler, _BatchResult, build_req_from_generate
 from lake.runtime.role import RoleConfig
 from lake.runtime.scheduler_output import ForwardMode, SchedulerOutput
+from lake.testing import make_runner
 
 
 class FakePool:
@@ -44,9 +48,8 @@ class FakePool:
 
 def _make_sched(overlap: bool = True, max_running: int = 8) -> Tuple[NodeScheduler, FakePool]:
     pool = FakePool()
-    runner = ModelRunner(pool, model_backend="mock")  # type: ignore[arg-type]
+    runner = make_runner(pool)
     role = RoleConfig(
-        model_backend="mock",
         enable_overlap=overlap,
         max_running_reqs=max_running,
     )
@@ -55,13 +58,13 @@ def _make_sched(overlap: bool = True, max_running: int = 8) -> Tuple[NodeSchedul
 
 def test_extend_then_decode_finishes() -> None:
     sched, pool = _make_sched()
-    req = build_req_from_generate("r1", "mock-llm", list(range(16)), max_new_tokens=3, node_id="n0")
+    req = build_req_from_generate("r1", "tiny-llm", list(range(16)), max_new_tokens=3, node_id="n0")
     sched.add_request(req)
     sched.run_until_idle()
     done = sched.get_req("r1")
     assert done.finished
     assert done.num_output_tokens == 3
-    assert done.output_token_ids == [1016, 1017, 1018]
+    assert len(done.output_token_ids) == 3
     assert pool.finished == ["r1"]
     assert ForwardMode.EXTEND in pool.prepared_modes
     assert ForwardMode.DECODE in pool.prepared_modes
@@ -130,7 +133,7 @@ def test_future_map_holds_last_token() -> None:
     done = sched.get_req("r1")
     # 结束后 FutureMap 已 clear
     assert sched.future_map.resolve("r1") is None
-    assert done.output_token_ids[-1] == 1010  # seed=8 → 1009,1010
+    assert len(done.output_token_ids) == 2
 
 
 def test_schedule_marks_structured_output() -> None:
@@ -178,7 +181,6 @@ def test_respect_effective_sets_drops_req() -> None:
     """P2-1：prepare 缩批后 scheduler 不得再 execute 被丢的 req。"""
     from lake.engine.agents.memory import InMemoryAgent
     from lake.engine.pool_iface import PoolIface
-    from lake.runtime.role import RoleConfig
     from lake.runtime.scheduler_output import ForwardMode, ReqIoSet, SchedulerOutput
 
     ag = InMemoryAgent()
@@ -186,8 +188,8 @@ def test_respect_effective_sets_drops_req() -> None:
     ag.pull_cost_ms = 50
     ag.l0_token_end["keep"] = 4  # keep 本地已齐，无需补拉
     pool = PoolIface(ag, pull_budget_ms=10, allow_partial_hit=True)
-    role = RoleConfig(model_backend="mock", enable_overlap=False)
-    runner = ModelRunner(pool, model_backend="mock")
+    role = RoleConfig(enable_overlap=False)
+    runner = make_runner(pool)
     sched = NodeScheduler(pool, runner, role)
 
     out = SchedulerOutput(
@@ -217,15 +219,14 @@ def test_respect_effective_sets_drops_all() -> None:
     """
     from lake.engine.agents.memory import InMemoryAgent
     from lake.engine.pool_iface import PoolIface
-    from lake.runtime.role import RoleConfig
     from lake.runtime.scheduler_output import ForwardMode, ReqIoSet, SchedulerOutput
 
     ag = InMemoryAgent()
     ag.force_pull_reqs.update("a", "b")  # 两 req 都需补拉
     ag.pull_cost_ms = 50
     pool = PoolIface(ag, pull_budget_ms=10, allow_partial_hit=True)
-    role = RoleConfig(model_backend="mock", enable_overlap=False)
-    runner = ModelRunner(pool, model_backend="mock")
+    role = RoleConfig(enable_overlap=False)
+    runner = make_runner(pool)
     sched = NodeScheduler(pool, runner, role)
 
     out = SchedulerOutput(
@@ -256,16 +257,3 @@ def test_respect_effective_sets_drops_all() -> None:
     assert sched._inflight_decode.get("a", 0) == 0  # noqa: SLF001
     assert sched._inflight_decode.get("b", 0) == 0  # noqa: SLF001
     pool.done(out.step_id)
-
-
-if __name__ == "__main__":
-    test_extend_then_decode_finishes()
-    test_continuous_batching_two_reqs()
-    test_overlap_process_lags_execute()
-    test_sync_loop_process_before_next_execute()
-    test_future_map_holds_last_token()
-    test_schedule_marks_structured_output()
-    test_spec_and_structured_output_disables_overlap()
-    test_respect_effective_sets_drops_req()
-    test_respect_effective_sets_drops_all()
-    print("test_node_scheduler_mock OK")

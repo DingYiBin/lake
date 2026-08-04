@@ -36,12 +36,6 @@ from lake.runtime.scheduler_output import (
 LOG = logging.getLogger("lake.node_scheduler")
 
 
-def mock_decode_tokens(prompt: List[int], max_new: int) -> List[int]:
-    """可复现 mock:基于 prompt 末 token 递推固定序列（与旧 worker 一致）。"""
-    seed = prompt[-1] if prompt else 0
-    return [((seed + i + 1) % 1000) + 1000 for i in range(max_new)]
-
-
 @dataclass
 class _BatchResult:
     output: SchedulerOutput
@@ -67,7 +61,6 @@ class NodeScheduler:
         self._waiting: List[str] = []
         self._running: List[str] = []
         self._step_id = 0
-        self._mock_remaining: Dict[str, List[int]] = {}
         # 已 schedule、尚未 process 的 decode token 数（overlap 下 Host Req 滞后一步）
         self._inflight_decode: Dict[str, int] = {}
         self._future_map = FutureMap()
@@ -76,10 +69,6 @@ class NodeScheduler:
         self._pending_drafts: Dict[str, List[int]] = {}
         # 测试钩子：记录 execute / process 时序
         self.timeline: List[Tuple[str, int]] = []
-
-    @property
-    def _use_runner_tokens(self) -> bool:
-        return self._role.model_backend == "qwen3"
 
     @property
     def _spec_enabled(self) -> bool:
@@ -111,11 +100,6 @@ class NodeScheduler:
                 req.num_computed_tokens = len(req.prompt_token_ids)
         self._reqs[req.req_id] = req
         self._waiting.append(req.req_id)
-        max_new = req.sampling_params.max_new_tokens
-        if self._role.model_backend == "mock":
-            self._mock_remaining[req.req_id] = mock_decode_tokens(req.prompt_token_ids, max_new)
-        else:
-            self._mock_remaining[req.req_id] = []
 
     def has_work(self) -> bool:
         """是否仍有 waiting / running / 未 process 的结果。"""
@@ -144,7 +128,6 @@ class NodeScheduler:
             self._running.remove(req_id)
         self._inflight_decode.pop(req_id, None)
         self._pending_drafts.pop(req_id, None)
-        self._mock_remaining.pop(req_id, None)
         self._future_map.clear(req_id)
         self._runner.clear_drafter(req_id)
         return self._reqs.pop(req_id, None)
@@ -443,15 +426,9 @@ class NodeScheduler:
                 continue
 
             inflight = self._inflight_decode.get(rid, 0)
-            if self._use_runner_tokens:
-                left = req.sampling_params.max_new_tokens - req.num_output_tokens - inflight
-                if left <= 0:
-                    continue
-            else:
-                remain = self._mock_remaining.get(rid) or []
-                if len(remain) <= inflight:
-                    continue
-                left = len(remain) - inflight
+            left = req.sampling_params.max_new_tokens - req.num_output_tokens - inflight
+            if left <= 0:
+                continue
 
             pending = self._pending_drafts.get(rid) or []
             _ = self._future_map.resolve(rid)
@@ -633,30 +610,20 @@ class NodeScheduler:
             if spec is not None:
                 self._pending_drafts.pop(rid, None)
 
-            if self._use_runner_tokens:
-                produced = list(runner_out.next_token_ids.get(rid) or [])
-                left = req.sampling_params.max_new_tokens - req.num_output_tokens
-                if left < len(produced):
-                    produced = produced[:left]
-                for tok in produced:
-                    req.output_token_ids.append(int(tok))
-                    req.num_computed_tokens += 1
-                if produced:
-                    self._future_map.stash(rid, int(produced[-1]))
-                # D10：InMemory 绝对值 commit × overlap 不安全；见 compute-layer D10
-                self._pool.commit_write_extent(rid, len(req.all_token_ids))
-                next_d = runner_out.next_draft_tokens.get(rid) or []
-                if next_d and not req.finished:
-                    self._pending_drafts[rid] = next_d
-            else:
-                remain = self._mock_remaining.get(rid) or []
-                if remain:
-                    tok = remain.pop(0)
-                    req.output_token_ids.append(tok)
-                    req.num_computed_tokens += 1
-                    self._mock_remaining[rid] = remain
-                    self._future_map.stash(rid, tok)
-                self._pool.commit_write_extent(rid, len(req.all_token_ids))
+            produced = list(runner_out.next_token_ids.get(rid) or [])
+            left = req.sampling_params.max_new_tokens - req.num_output_tokens
+            if left < len(produced):
+                produced = produced[:left]
+            for tok in produced:
+                req.output_token_ids.append(int(tok))
+                req.num_computed_tokens += 1
+            if produced:
+                self._future_map.stash(rid, int(produced[-1]))
+            # D10：InMemory 绝对值 commit × overlap 不安全；见 compute-layer D10
+            self._pool.commit_write_extent(rid, len(req.all_token_ids))
+            next_d = runner_out.next_draft_tokens.get(rid) or []
+            if next_d and not req.finished:
+                self._pending_drafts[rid] = next_d
 
             if req.num_output_tokens >= req.sampling_params.max_new_tokens:
                 req.finished = True

@@ -5,13 +5,13 @@ from __future__ import annotations
 from lake.engine.agents.memory import InMemoryAgent
 from lake.engine.model_executor.layers.attentions import build_attn_metadata
 from lake.engine.input_batch import InputBatch, InputBuffers
-from lake.engine.model_runner import ModelRunner
 from lake.engine.pool_iface import PoolIface
 from lake.engine.pool_types import PreparePlan, ReadyHandle
 from lake.kernels.attn_ref import causal_attn_queries
 from lake.runtime.node_scheduler import NodeScheduler, build_req_from_generate
 from lake.runtime.role import RoleConfig
 from lake.runtime.scheduler_output import ForwardMode, ReqIoSet, SchedulerOutput
+from lake.testing import make_runner
 
 
 def test_causal_attn_queries_matches_full_slice() -> None:
@@ -27,7 +27,7 @@ def test_causal_attn_queries_matches_full_slice() -> None:
 
 def test_prepare_inputs_attn_metadata() -> None:
     pool = PoolIface(InMemoryAgent())
-    runner = ModelRunner(pool, model_backend="mock")
+    runner = make_runner(pool, load=False)
     req = build_req_from_generate("r", "m", list(range(8)), 2, "n0")
     out = SchedulerOutput(
         step_id=1,
@@ -52,7 +52,7 @@ def test_prepare_inputs_attn_metadata() -> None:
 
 def test_decode_slot_mapping_matches_query_position() -> None:
     pool = PoolIface(InMemoryAgent())
-    runner = ModelRunner(pool, model_backend="mock")
+    runner = make_runner(pool, load=False)
     req = build_req_from_generate("r", "m", list(range(4)), 1, "n0")
     req.num_computed_tokens = len(req.prompt_token_ids)
     out = SchedulerOutput(
@@ -79,7 +79,7 @@ def test_decode_slot_mapping_matches_query_position() -> None:
 
 def test_prepare_inputs_uses_scheduler_query_geometry_under_overlap() -> None:
     pool = PoolIface(InMemoryAgent())
-    runner = ModelRunner(pool, model_backend="mock")
+    runner = make_runner(pool, load=False)
     req = build_req_from_generate("r", "m", list(range(4)), 2, "n0")
     req.num_computed_tokens = len(req.prompt_token_ids)
     out = SchedulerOutput(
@@ -108,19 +108,18 @@ def test_prepare_inputs_uses_scheduler_query_geometry_under_overlap() -> None:
     assert meta.slot_mapping == [4]
 
 
-def test_two_reqs_same_batch_mock() -> None:
+def test_two_reqs_same_batch() -> None:
     ag = InMemoryAgent()
     pool = PoolIface(ag)
     role = RoleConfig(
-        model_backend="mock",
         enable_overlap=False,
         max_running_reqs=4,
         max_num_scheduled_tokens=64,
     )
-    runner = ModelRunner(pool, model_backend="mock")
+    runner = make_runner(pool)
     sched = NodeScheduler(pool, runner, role)
-    sched.add_request(build_req_from_generate("a", "mock", list(range(6)), 2, "n0"))
-    sched.add_request(build_req_from_generate("b", "mock", list(range(6, 12)), 2, "n0"))
+    sched.add_request(build_req_from_generate("a", "m", list(range(6)), 2, "n0"))
+    sched.add_request(build_req_from_generate("b", "m", list(range(6, 12)), 2, "n0"))
     out = sched.schedule()
     assert len(out.num_scheduled_tokens) == 2
     assert out.forward_mode == ForwardMode.EXTEND

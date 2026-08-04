@@ -121,7 +121,7 @@ def test_qwen3_module_tree_matches_vllm_packed_layout() -> None:
 def test_qwen3_load_model_rejects_unsupported_architecture() -> None:
     ag = InMemoryAgent()
     pool = PoolIface(ag)
-    unsupported = ModelRunner(pool, model_backend="qwen3", model_config=UnitUnsupportedConfig())
+    unsupported = ModelRunner(pool, model_config=UnitUnsupportedConfig())
     try:
         unsupported.load_model(model_path="unit/unsupported")
         raise AssertionError("expected unsupported architecture")
@@ -156,12 +156,12 @@ def test_model_runner_uses_registered_architecture_for_load_model() -> None:
     try:
         ag = InMemoryAgent()
         pool = PoolIface(ag)
-        runner = ModelRunner(pool, model_backend="qwen3", model_config=UnitCustomConfig())
+        runner = ModelRunner(pool, model_config=UnitCustomConfig())
         info = runner.load_model(model_path="unit/custom", revision="r1")
         assert info.model_path == "unit/custom"
         assert info.served_model_name == "model"
         assert info.revision == "r1"
-        assert info.backend == "qwen3"
+        assert info.architecture == "UnitCustomForCausalLM"
         assert info.load_format == "dummy"
         assert info.load_dummy_weights is True
     finally:
@@ -175,12 +175,11 @@ def test_scheduler_qwen3_dummy_finishes() -> None:
     ag = InMemoryAgent()
     pool = PoolIface(ag)
     role = RoleConfig(
-        model_backend="qwen3",
         model_path=QWEN3_0_6B_MODEL_ID,
         enable_overlap=False,
         max_running_reqs=2,
     )
-    runner = ModelRunner(pool, model_backend="qwen3")
+    runner = ModelRunner(pool)
     runner.load_model(model_path=QWEN3_0_6B_MODEL_ID)
     sched = NodeScheduler(pool, runner, role)
     sched.add_request(build_req_from_generate("q1", "model", list(range(8)), 3, "n0"))
@@ -195,7 +194,7 @@ def test_scheduler_qwen3_dummy_finishes() -> None:
 def test_qwen3_dummy_decode_uses_sampling_bitmask() -> None:
     ag = InMemoryAgent()
     pool = PoolIface(ag)
-    runner = ModelRunner(pool, model_backend="qwen3")
+    runner = ModelRunner(pool)
     runner.load_model(model_path=QWEN3_0_6B_MODEL_ID)
     req = Req(
         req_id="q-mask",

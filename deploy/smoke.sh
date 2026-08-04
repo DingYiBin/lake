@@ -22,7 +22,7 @@ post() {
     -d "$(python3 - <<PY
 import json
 print(json.dumps({
-  "model": "mock-llm",
+  "model": "tiny-llm",
   "messages": [
     {"role": "system", "content": "$SYS"},
     {"role": "user", "content": "$user"},

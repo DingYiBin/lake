@@ -7,12 +7,12 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple
 
-from lake.engine.model_runner import ModelRunner
 from lake.engine.pool_iface import ReadyHandle, StepStats
 from lake.runtime.node_scheduler import build_req_from_generate
 from lake.runtime.role import RoleConfig, WorkerRole
 from lake.runtime.scheduler_output import ForwardMode, SchedulerOutput
 from lake.runtime.worker_engine import WorkerEngine
+from lake.testing import make_runner
 
 
 QWEN3_0_6B_MODEL_ID = os.path.expanduser(
@@ -50,11 +50,11 @@ class FakePool:
 
 def _make_engine(max_running: int = 8, coalesce_s: float = 0.005) -> Tuple[WorkerEngine, FakePool]:
     pool = FakePool()
-    runner = ModelRunner(pool, model_backend="mock")  # type: ignore[arg-type]
+    runner = make_runner(pool, load=False)
     role = RoleConfig(
         enable_overlap=True,
         max_running_reqs=max_running,
-        model_backend="mock",
+        model_path="tiny-qwen3",
     )
     eng = WorkerEngine(pool, runner, role, coalesce_s=coalesce_s)  # type: ignore[arg-type]
     eng.start()
@@ -76,7 +76,7 @@ def test_submit_single_request() -> None:
 
 def test_concurrent_submit_shared_scheduler() -> None:
     """两并发 submit 进同一 Scheduler；至少一步同批多 req。"""
-    # 加长 coalesce，避免 mock 过快在第二请求入队前跑完第一请求
+    # 加长 coalesce，避免过快在第二请求入队前跑完第一请求
     eng, pool = _make_engine(max_running=4, coalesce_s=0.05)
     barrier = threading.Barrier(2)
 
@@ -102,7 +102,6 @@ def test_concurrent_submit_shared_scheduler() -> None:
 def test_role_config_from_env() -> None:
     keys = [
         "LAKE_WORKER_ROLE",
-        "LAKE_MODEL_BACKEND",
         "LAKE_ENABLE_DRAFTER",
         "LAKE_MAX_RUNNING_REQS",
         "LAKE_ENABLE_OVERLAP",
@@ -115,7 +114,6 @@ def test_role_config_from_env() -> None:
     saved = {k: os.environ.get(k) for k in keys}
     try:
         os.environ["LAKE_WORKER_ROLE"] = "prefill"
-        os.environ["LAKE_MODEL_BACKEND"] = "qwen3"
         os.environ["LAKE_ENABLE_DRAFTER"] = "1"
         os.environ["LAKE_MAX_RUNNING_REQS"] = "3"
         os.environ["LAKE_ENABLE_OVERLAP"] = "0"
@@ -126,7 +124,6 @@ def test_role_config_from_env() -> None:
         os.environ["LAKE_WARMUP_TOKENS_PER_REQ"] = "3"
         cfg = RoleConfig.from_env()
         assert cfg.role == WorkerRole.PREFILL
-        assert cfg.model_backend == "qwen3"
         assert cfg.model_path == QWEN3_0_6B_MODEL_ID
         assert cfg.served_model_name == "public-qwen"
         assert cfg.model_revision == "r1"

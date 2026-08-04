@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from lake.engine.agents.memory import InMemoryAgent
-from lake.engine.model_runner import ModelRunner
 from lake.engine.pool_iface import PoolIface
 from lake.runtime.exec_mode import ExecMode
 from lake.runtime.mode_select import full_local_hit, select_exec_mode
@@ -12,6 +11,7 @@ from lake.runtime.prefix_hint import PrefixHint
 from lake.runtime.req import Req
 from lake.runtime.role import RoleConfig, WorkerRole
 from lake.runtime.scheduler_output import ForwardMode, ReqIoSet, SamplingParams, SchedulerOutput
+from lake.testing import make_runner
 
 
 def test_mode_select_d_direct() -> None:
@@ -39,8 +39,8 @@ def test_full_local_hit_skips_prompt_phase() -> None:
     """整段 L0 命中：无 prompt 残差步，直接 DECODE（无 PREBUILT 分相）。"""
     ag = InMemoryAgent()
     pool = PoolIface(ag)
-    role = RoleConfig(model_backend="mock", enable_overlap=False)
-    runner = ModelRunner(pool, model_backend="mock")
+    role = RoleConfig(enable_overlap=False)
+    runner = make_runner(pool)
     sched = NodeScheduler(pool, runner, role)
 
     prompt = list(range(8))
@@ -80,8 +80,8 @@ def test_full_local_hit_skips_prompt_phase() -> None:
 def test_partial_hit_prompt_residual_has_read_set() -> None:
     ag = InMemoryAgent()
     pool = PoolIface(ag)
-    role = RoleConfig(model_backend="mock", enable_overlap=False)
-    runner = ModelRunner(pool, model_backend="mock")
+    role = RoleConfig(enable_overlap=False)
+    runner = make_runner(pool)
     sched = NodeScheduler(pool, runner, role)
     prompt = list(range(16))
     ag.seed_local_prefix("p1", 8)
@@ -100,7 +100,7 @@ def test_partial_hit_prompt_residual_has_read_set() -> None:
 def test_forward_exception_does_not_call_done() -> None:
     ag = InMemoryAgent()
     pool = PoolIface(ag)
-    runner = ModelRunner(pool, model_backend="qwen3")
+    runner = make_runner(pool)
     runner._forward_model = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))  # noqa: SLF001
     req = Req(
         req_id="r1",

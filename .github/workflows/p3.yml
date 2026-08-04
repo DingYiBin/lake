@@ -10,6 +10,7 @@ on:
       - "go/**"
       - "python/**"
       - "deploy/**"
+      - "testdata/**"
       - "scripts/verify-p3.sh"
       - ".github/workflows/p3.yml"
 
@@ -47,12 +48,14 @@ jobs:
         with:
           python-version: "3.12"
       - name: Python runtime deps
-        run: pip install "grpcio>=1.82.1" "protobuf>=7.35.0" "transformers"
+        # smoke 走 load_format=dummy + testdata/tiny-qwen3（对齐 vLLM DummyModelLoader）；需 CPU torch。
+        run: |
+          pip install "grpcio>=1.82.1" "protobuf>=7.35.0" "numpy==2.2.6" "transformers"
+          pip install "torch==2.11.0" --index-url https://download.pytorch.org/whl/cpu
       - name: start stack
         env:
-          # P3 smoke 只验证三语言骨架联通性；不安装 Torch，避免触发 Qwen3 backend。
-          LAKE_MODEL_BACKEND: mock
-          LAKE_SERVED_MODEL_NAME: mock-llm
+          LAKE_MODEL_PATH: testdata/tiny-qwen3
+          LAKE_SERVED_MODEL_NAME: tiny-llm
         run: |
           ./deploy/run-local.sh &
           echo $! > /tmp/lake-stack.pid

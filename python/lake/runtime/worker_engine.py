@@ -95,7 +95,7 @@ class WorkerEngine:
             max_running_reqs=self._role.max_running_reqs,
             state=self._life.state,
             role=self._role.role.value,
-            model_backend=self._role.model_backend,
+            architecture=self._runner.architecture,
             served_model_name=self._runner.served_model_name,
             model_loaded=self._runner.model_loaded,
             model_warmed=self._runner.model_warmed,
