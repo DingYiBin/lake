@@ -86,6 +86,7 @@ class InputBuffers:
         *,
         device: DeviceLike = "cpu",
         max_num_blocks: int = 256,
+        block_size: int = 8,
     ) -> None:
         if max_num_reqs <= 0:
             raise ValueError("max_num_reqs must be > 0")
@@ -93,10 +94,14 @@ class InputBuffers:
             raise ValueError("max_num_tokens must be > 0")
         if max_num_blocks <= 0:
             raise ValueError("max_num_blocks must be > 0")
+        if block_size <= 0:
+            raise ValueError("block_size must be > 0")
 
         self.max_num_reqs = max_num_reqs
         self.max_num_tokens = max_num_tokens
         self.max_num_blocks = max_num_blocks
+        # C16b：paged KV arena 按 block_size 分页；arena 总槽 = max_num_blocks * block_size。
+        self.block_size = block_size
         self.device = torch.device(device)
         self._use_staging = self.device.type == "cuda"
 

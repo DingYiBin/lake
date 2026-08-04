@@ -27,4 +27,8 @@ def __getattr__(name: str):
         from lake.engine.model_executor.layers.attentions import backends
 
         return getattr(backends, name)
+    if name in {"ForwardContext", "forward_context", "get_forward_context"}:
+        from lake.engine.model_executor.layers.attentions import context
+
+        return getattr(context, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

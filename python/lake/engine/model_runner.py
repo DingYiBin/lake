@@ -88,6 +88,9 @@ class ModelRunner:
         self._model_revision = ""
         self._model_loaded = False
         self._model_warmed = False
+        # C16b：mock KV arena（per-layer (k_cache, v_cache)）。生产由存储池放置；
+        # 此处 runner 持 mock 句柄供 dummy/test paged 路径，arena 归属后置到池。
+        self._kv_caches: Optional[List[Any]] = None
 
     @property
     def model_loaded(self) -> bool:
@@ -149,6 +152,8 @@ class ModelRunner:
         # 真权重（load_format="hf"）由 DefaultModelLoader 装载，不物化。
         if loaded.load_format == "dummy":
             materialize_model(self._model, device="cpu")
+        # C16b：分配 mock KV arena（per-layer k/v），供 paged forward_varlen 路径。
+        self._kv_caches = self._allocate_kv_caches()
         self._architecture = loaded.architecture
         self._model_path = loaded.model_path
         self._served_model_name = served_model_name or "model"
@@ -167,6 +172,36 @@ class ModelRunner:
         if pin_weights and self._weight_pin_callback is not None:
             self._weight_pin_callback(info)
         return info
+
+    def _allocate_kv_caches(self) -> List[Any]:
+        """C16b：分配 mock per-layer KV arena（``[total_slots, num_kv_heads, head_dim]``）。
+
+        生产由存储池放置 HBM（方案 Z）；dummy/test 路径由 runner 持 mock 句柄。
+        ``total_slots = max_num_blocks * block_size`` 覆盖 block_table 引用的全部 block。
+        非 Qwen3 结构（自定义/测试桩无 ``model.layers``）返回空列表 → 走 C16a 回退。
+        """
+        assert self._model is not None
+        model = getattr(self._model, "model", None)
+        layers = getattr(model, "layers", None)
+        if not layers:
+            return []
+        cfg = self._model.config
+        num_layers = int(getattr(cfg, "num_hidden_layers", len(layers)))
+        layer0 = layers[0]
+        num_kv_heads = int(getattr(layer0.self_attn, "num_kv_heads", 0))
+        head_dim = int(getattr(layer0.self_attn, "head_dim", 0))
+        if num_kv_heads <= 0 or head_dim <= 0:
+            return []
+        dtype = next(self._model.parameters()).dtype
+        device = next(self._model.parameters()).device
+        total_slots = self._input_buffers.max_num_blocks * self._input_buffers.block_size
+        return [
+            (
+                torch.zeros(total_slots, num_kv_heads, head_dim, dtype=dtype, device=device),
+                torch.zeros(total_slots, num_kv_heads, head_dim, dtype=dtype, device=device),
+            )
+            for _ in range(num_layers)
+        ]
 
     def warmup(
         self,
@@ -342,12 +377,49 @@ class ModelRunner:
         host_reqs: Mapping[str, Req],
         batch: InputBatch,
     ) -> Tuple[Dict[str, List[int]], Dict[str, List[int]]]:
-        """C16a：逐请求真实 forward（非分页 dummy 路径）。
+        """C16b：batched paged forward（生产形态 dummy 路径）。
 
-        对每个非 prompt-phase 请求，把全上下文 ``input_ids`` 喂模型（B=1、对全序列
-        causal attention），取末位 token logits 采样。正确但 O(T²)——仅 dummy/test；
-        生产 paged 路径（KV arena、batched forward_varlen）见 C16b。
+        本步所有 query token 拼成 flat ``input_ids``（来自 ``InputBuffers``，仅本步
+        新算 token，非全上下文），经模型 forward：每层 attention 把新 k/v 按
+        ``slot_mapping`` 写入 mock KV arena、``forward_varlen`` 读 paged 前缀 KV。
+        取每请求末位 query token 的 logits 采样。非 prompt-phase 跳过采样（与 C16a
+        一致：prefill 首 token 由后续 decode 产出）。无 KV arena 时回退到 C16a 逐请求
+        非分页路径。
         """
+        assert self._model is not None
+        meta = self._attn_meta
+        # paged 路径需 agent 出 block table；未出（测试桩 / 无 arena）回退 C16a 逐请求。
+        if meta is None or not self._kv_caches or not meta.block_tables:
+            return self._forward_model_per_req(output, host_reqs, batch)
+
+        buffers = self._input_buffers
+        nt = buffers.effective_num_tokens
+        input_ids = buffers.input_ids[:nt].to(torch.long)
+        positions = buffers.positions[:nt].to(torch.long)
+        from lake.engine.model_executor.layers.attentions.context import forward_context
+        with forward_context(meta, self._kv_caches):
+            with torch.no_grad():
+                hidden = self._model.forward(input_ids, positions)
+                logits = self._model.compute_logits(hidden)  # [nt, vocab]
+
+        qsl = meta.query_start_loc
+        last_logits: Dict[str, List[float]] = {}
+        for row, req_id in enumerate(batch.req_ids):
+            if batch.is_prompt_phase[row]:
+                continue
+            last_idx = int(qsl[row + 1].item()) - 1
+            if last_idx < 0:
+                continue
+            last_logits[req_id] = logits[last_idx].to(torch.float32).tolist()
+        return self.sample_tokens(output, host_reqs, last_logits)
+
+    def _forward_model_per_req(
+        self,
+        output: SchedulerOutput,
+        host_reqs: Mapping[str, Req],
+        batch: InputBatch,
+    ) -> Tuple[Dict[str, List[int]], Dict[str, List[int]]]:
+        """C16a 逐请求非分页 forward（无 KV arena 时的回退路径）。"""
         assert self._model is not None
         last_logits: Dict[str, List[float]] = {}
         for row, req_id in enumerate(batch.req_ids):

@@ -259,12 +259,12 @@ class Qwen3Attention(nn.Module):
         self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
 
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
-        """C16a：真实 attention forward（非分页 dummy 路径）。
+        """C16a/C16b：真实 attention forward。
 
-        ``hidden_states [T, hidden]`` → ``qkv_proj`` → 拆 q/k/v → ``q_norm``/``k_norm``
-        → RoPE → ``Qwen3PagedAttention``（``attn_meta=None`` 走 ``forward_tensors``，
-        对全序列 causal）→ ``o_proj`` → ``[T, hidden]``。paged 路径（``attn_meta`` 非空、
-        KV arena）见 C16b。
+        paged 路径（forward context 携 ``attn_meta`` + per-layer KV arena）：``qkv_proj``
+        → 拆 q/k/v → ``q_norm``/``k_norm`` → RoPE → 写新 k/v 到 arena（按 ``slot_mapping``）
+        → ``forward_varlen`` 读 paged KV → ``o_proj``。非分页 dummy 路径（无 context）：
+        RoPE → ``forward_tensors``（B=1、全序列 causal）→ ``o_proj``。
         """
         T = hidden_states.shape[0]
         qkv = self.qkv_proj(hidden_states)  # [T, q_size + 2*kv_size]（TP=1 全宽）
@@ -277,7 +277,27 @@ class Qwen3Attention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
         q, k = self.rotary_emb(positions, q, k)
-        # forward_tensors 要 [B, H, T, D]：B=1
+
+        from lake.engine.model_executor.layers.attentions.context import get_forward_context
+        ctx = get_forward_context()
+        if (
+            ctx is not None
+            and ctx.attn_meta is not None
+            and ctx.kv_caches is not None
+        ):
+            meta = ctx.attn_meta
+            k_cache, v_cache = ctx.kv_caches[self.layer_idx]
+            slot_mapping = meta.slot_mapping  # [T]（effective，pad 槽为 -1）
+            valid = slot_mapping >= 0
+            if valid.any():
+                k_cache.index_copy_(0, slot_mapping[valid].long(), k[valid])
+                v_cache.index_copy_(0, slot_mapping[valid].long(), v[valid])
+            # forward_varlen：q [num_tokens, H, D]，k/v 为 arena 句柄
+            out = self.attn(q, k_cache, v_cache, attn_meta=meta)  # [num_tokens, H, D]
+            attn_out = out.reshape(T, self.num_heads * self.head_dim)
+            return self.o_proj(attn_out)
+
+        # 非分页 dummy 路径（C16a）：forward_tensors 要 [B, H, T, D]：B=1
         q_bt = q.unsqueeze(0).permute(0, 2, 1, 3)  # [1, H, T, D]
         k_bt = k.unsqueeze(0).permute(0, 2, 1, 3)
         v_bt = v.unsqueeze(0).permute(0, 2, 1, 3)

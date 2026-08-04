@@ -312,3 +312,69 @@ def test_runner_dummy_run_produces_real_forward_tokens() -> None:
     assert len(out.next_token_ids) == 1
     tok = next(iter(out.next_token_ids.values()))[0]
     assert 0 <= tok < QWEN3_0_6B_CONFIG.vocab_size
+
+
+def test_qwen3_paged_forward_matches_nonpaged() -> None:
+    """C16b：paged forward_varlen 路径与逐请求非分页 forward 末位 logits 对齐。
+
+    EXTEND（q_len=4，写 4 token KV 到 arena）→ DECODE（q_len=1，读 paged KV）
+    的末位 logits，应与对全序列 causal 非分页 forward 的末位 logits 一致（decode
+    单 token full-visible 等价于 causal 末位）。
+    """
+    from lake.engine.model_executor.layers.attentions import build_attn_metadata
+    from lake.engine.model_executor.layers.attentions.context import forward_context
+    from lake.engine.model_executor.models.loader import materialize_model
+    from lake.engine.model_executor.layers.attentions import build_attn_backend
+
+    cfg = _tiny_qwen3_config()
+    model = Qwen3ForCausalLM(cfg, attn_backend=build_attn_backend("cpu"))
+    materialize_model(model, device="cpu", dtype=torch.float32, seed=3)
+    num_layers = cfg.num_hidden_layers
+    num_kv_heads = cfg.num_key_value_heads
+    head_dim = cfg.head_dim
+    total_slots = 256 * 8
+    kv_caches = [
+        (
+            torch.zeros(total_slots, num_kv_heads, head_dim, dtype=torch.float32),
+            torch.zeros(total_slots, num_kv_heads, head_dim, dtype=torch.float32),
+        )
+        for _ in range(num_layers)
+    ]
+    ctx = [5, 6, 7, 8]
+    input_ids = torch.tensor(ctx, dtype=torch.long)
+    positions = torch.arange(4, dtype=torch.long)
+
+    # 非分页参照：全序列 causal forward
+    with torch.no_grad():
+        ref_logits = model.compute_logits(model.forward(input_ids, positions))
+
+    # paged EXTEND：写 4 token KV 到 arena slot 0..3
+    meta_ext = build_attn_metadata(
+        seq_lens={"r": 4},
+        query_start={"r": 0},
+        query_end={"r": 4},
+        block_tables={"r": [0]},
+        slot_mapping_by_req={"r": [0, 1, 2, 3]},
+        req_order=["r"],
+    )
+    with forward_context(meta_ext, kv_caches):
+        with torch.no_grad():
+            model.forward(input_ids, positions)
+
+    # paged DECODE：末位 token（position 3）读 paged KV
+    meta_dec = build_attn_metadata(
+        seq_lens={"r": 4},
+        query_start={"r": 3},
+        query_end={"r": 4},
+        block_tables={"r": [0]},
+        slot_mapping_by_req={"r": [3]},
+        req_order=["r"],
+    )
+    dec_ids = torch.tensor([ctx[-1]], dtype=torch.long)
+    dec_pos = torch.tensor([3], dtype=torch.long)
+    with forward_context(meta_dec, kv_caches):
+        with torch.no_grad():
+            dec_logits = model.compute_logits(model.forward(dec_ids, dec_pos))
+
+    assert dec_logits.shape == (1, cfg.vocab_size)
+    torch.testing.assert_close(dec_logits[0], ref_logits[-1], rtol=1e-4, atol=1e-5)
