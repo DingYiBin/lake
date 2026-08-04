@@ -67,7 +67,35 @@ model forward / FA2 /（未来 graph）
 
 ### P3 — device pack（后续，可选）
 
-- token 镜像归属 + Triton pack；与「runner 无跨步状态」需单独设计
+> 单独设计节：vLLM/SGLang 的 device pack 依赖 runner 跨步 device token 历史，lake 无此状态，需厘清 P3 对 lake 的真实含义。
+
+**参考实现**
+
+| 概念 | 路径:符号 |
+|------|-----------|
+| prefill token scatter kernel | `vllm/v1/worker/gpu/input_batch.py::_prepare_prefill_inputs_kernel`（经 `idx_mapping` 读 device 常驻 `all_token_ids`，scatter 进静态 `input_ids`） |
+| positions/seq_lens kernel | 同文件 `_prepare_pos_seq_lens_kernel` / `prepare_pos_seq_lens`（device 上算 `positions`/`seq_lens`/`query_start_loc`） |
+| SGLang device token | `ScheduleBatch`/`ForwardBatch`：prefill `prefill_input_ids_cpu`(pinned)→`input_ids` GPU；decode 从 FutureMap device relay gather |
+
+**张力（为什么 P3 不能照搬 vLLM）**
+
+vLLM/SGLang 的 device pack 价值 = **省 token H2D**——token 历史已 device 常驻（vLLM runner 跨步 `RequestState` 的 `all_token_ids [num_reqs_state, max_model_len]`；SGLang `ForwardBatch` GPU `input_ids` + FutureMap relay），kernel 直接读 device tensor scatter。lake 的 runner **无跨步状态**（`Req` 含 token 历史在 host `node_scheduler`，引擎无跨步请求表——比 SGLang 更彻底），token 必须从 host H2D，**无法从 device tensor 读**。因此"省 token H2D"这条收益在 lake 不成立。
+
+**P3 对 lake 的真实含义**
+
+P3-for-lake ≠ 省 token H2D，而是 **把几何 packing（`positions`/`seq_lens`/`query_start_loc`/`slot_mapping` scatter）从 host Python 循环迁到 device Triton kernel**，token 字节仍 H2D 进静态 `input_ids` buffer。收益有二：
+1. 去 host 热路径 Python 循环（`materialize` 现为 per-token Python loop）。
+2. **使能 CUDA graph capture**——graph replay 要求 packing 全为 device kernel（host Python loop 不可 capture）。
+
+**与「runner 无跨步状态」的兼容**
+
+几何 packing kernel 只读本步 `SchedulerOutput` 派生的少量标量（per-req `num_computed`/`query_start`/`query_end`/`q_len`）+ agent 的 `slot_mapping`/`block_table`，**不读跨步 token 历史**。token 字节由 host staging H2D 进静态 buffer（capture 时该 H2D 在 graph 外，或经 async copy stream）。故 P3-for-lake 不引入 runner 跨步 `RequestState`，与 Q1/Q2 契约兼容。
+
+**结论**
+
+- vLLM 式 device pack（省 token H2D）**不适用** lake（token host by design）。
+- P3-for-lake = 几何 device kernel → **graph-capture 使能器**。而 CUDA graph capture 本身标后置（D6），故 P3 是**前置使能、非独立热路径收益**。
+- 取舍：现在实现 = 前瞻投资（kernel 不上当前热路径，等 graph capture 落地才生效）；defer = 等 graph capture 提上日程时一并做（kernel 与 capture 形状/约束同设计更稳）。
 
 ## 不做
 
@@ -83,4 +111,4 @@ model forward / FA2 /（未来 graph）
 | P0 InputBuffers | **done**（`device` + pin staging H2D；默认 cpu） |
 | P1 AttentionMetadata | **done**（热路径 tensor + 2D `block_table`；FA2/Cpu 消费） |
 | P2 压缩 host `InputBatch` | **done**（行稠密 list 平行于 `req_ids`；`add_request` / `index_of`；materialize 按行迭代） |
-| P3 device pack | pending（可选） |
+| P3 device pack | **设计 done**（vLLM 式省 H2D 不适用；lake 价值=几何 device kernel→graph-capture 使能器；graph capture 后置→P3 实现待 graph capture 提日程时一并做） |
