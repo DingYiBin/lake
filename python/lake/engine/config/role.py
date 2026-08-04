@@ -42,6 +42,10 @@ class RoleConfig:
     model_revision: str = ""
     warmup_num_reqs: int = 1
     warmup_tokens_per_req: int = 1
+    # P3.1 固定 shape padding（graph capture 地基）：0=变长/关；>0=pad 到固定值。
+    # forward 永远看到 padded shape，is_padding mask 区分真实/pad。graph capture 本身仍后置。
+    pad_num_reqs: int = 0
+    pad_num_tokens: int = 0
     # 并行规模 / 通讯域（对齐 vLLM ParallelConfig 子集；默认单卡）
     parallel: ParallelConfig = field(default_factory=ParallelConfig)
 
@@ -58,6 +62,15 @@ class RoleConfig:
             raise ValueError(
                 f"warmup_tokens_per_req must be > 0, got {self.warmup_tokens_per_req}"
             )
+        if self.pad_num_reqs < 0 or self.pad_num_tokens < 0:
+            raise ValueError(
+                f"pad_num_reqs/pad_num_tokens must be >= 0, got "
+                f"{self.pad_num_reqs}/{self.pad_num_tokens}"
+            )
+        if (self.pad_num_reqs > 0) != (self.pad_num_tokens > 0):
+            raise ValueError(
+                "pad_num_reqs and pad_num_tokens must be both set or both 0"
+            )
 
     @classmethod
     def from_env(cls) -> "RoleConfig":
@@ -71,6 +84,7 @@ class RoleConfig:
         LAKE_MODEL_PATH / LAKE_SERVED_MODEL_NAME / LAKE_MODEL_REVISION
         LAKE_ATTN_BACKEND
         LAKE_WARMUP_NUM_REQS / LAKE_WARMUP_TOKENS_PER_REQ
+        LAKE_PAD_NUM_REQS / LAKE_PAD_NUM_TOKENS（>0 时 pad 到固定 shape；graph capture 地基）
         LAKE_TP_SIZE / LAKE_PP_SIZE / LAKE_DP_SIZE / LAKE_DP_RANK（见 ParallelConfig.from_env）
         """
         role_raw = os.environ.get("LAKE_WORKER_ROLE", "hybrid").strip().lower()
@@ -98,5 +112,7 @@ class RoleConfig:
             pull_budget_ms=env_int("LAKE_PULL_BUDGET_MS", 0),
             warmup_num_reqs=env_int("LAKE_WARMUP_NUM_REQS", 1),
             warmup_tokens_per_req=env_int("LAKE_WARMUP_TOKENS_PER_REQ", 1),
+            pad_num_reqs=env_int("LAKE_PAD_NUM_REQS", 0),
+            pad_num_tokens=env_int("LAKE_PAD_NUM_TOKENS", 0),
             parallel=ParallelConfig.from_env(),
         )

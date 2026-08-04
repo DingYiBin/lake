@@ -281,3 +281,71 @@ def test_forward_varlen_chunked_extend() -> None:
     full_q[4:] = q
     expected = _manual_varlen_causal(full_q, k_per_req[0], v_per_req[0], scale=scale)[4:]
     torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_forward_varlen_skips_pad_reqs_under_fixed_shape() -> None:
+    """P3.1：固定 shape padding 下，pad req（q_len=0）被跳过，真实 req 输出不变。
+
+    q 为 padded shape [padded_tokens, H, D]；pad 段为 zeros。forward_varlen
+    按 query_start_loc 迭代，pad req q_len=0 → continue，只写真实段。
+    """
+    torch.manual_seed(5)
+    H, Hkv, D = 2, 1, 6
+    scale = D**-0.5
+    seq_lens = [5, 4]
+    q_lens = [5, 1]
+    q_per_req = [torch.randn(ql, H, D) for ql in q_lens]
+    k_per_req = [torch.randn(s, Hkv, D) for s in seq_lens]
+    v_per_req = [torch.randn(s, Hkv, D) for s in seq_lens]
+    k_cache, tables = _build_paged_kv(k_per_req, block_size=8)
+    v_cache, _ = _build_paged_kv(v_per_req, block_size=8)
+
+    actual_tokens = sum(q_lens)
+    padded_tokens = 16
+    padded_reqs = 4
+    # q padded：真实段 + zeros pad 段
+    q = torch.zeros(padded_tokens, H, D, dtype=q_per_req[0].dtype)
+    q[:actual_tokens] = torch.cat(q_per_req, dim=0)
+    # padded metadata：2 真实 req + 2 pad req（零长 query）
+    qsl = [0, 5, 6, 6, 6]
+    max_blocks = max((len(t) for t in tables), default=0)
+    bt = torch.zeros(padded_reqs, max(max_blocks, 1), dtype=torch.int32)
+    btl = torch.zeros(padded_reqs, dtype=torch.int32)
+    for i, row in enumerate(tables):
+        bt[i, : len(row)] = torch.tensor(row, dtype=torch.int32)
+        btl[i] = len(row)
+    seq_lens_padded = seq_lens + [0, 0]
+    meta = AttentionMetadata(
+        seq_lens={str(i): s for i, s in enumerate(seq_lens_padded)},
+        query_start={str(i): 0 for i in range(padded_reqs)},
+        query_end={str(i): seq_lens_padded[i] for i in range(padded_reqs)},
+        block_tables={str(i): tables[i] if i < len(tables) else [] for i in range(padded_reqs)},
+        block_table_tensor=bt,
+        block_table_lens=btl,
+        slot_mapping=torch.zeros(0, dtype=torch.int32),
+        positions=torch.zeros(0, dtype=torch.int64),
+        query_start_loc=torch.tensor(qsl, dtype=torch.int32),
+        seq_lens_ordered=torch.tensor(seq_lens_padded, dtype=torch.int32),
+        max_seq_len=max(seq_lens),
+        max_query_len=max(q_lens),
+        num_reqs=padded_reqs,
+        num_actual_tokens=padded_tokens,
+        actual_num_reqs=2,
+        actual_num_tokens=actual_tokens,
+        padded_num_reqs=padded_reqs,
+        padded_num_tokens=padded_tokens,
+        is_padding=torch.tensor(
+            [False] * actual_tokens + [True] * (padded_tokens - actual_tokens),
+            dtype=torch.bool,
+        ),
+    )
+
+    out = CpuAttentionBackend().forward_varlen(q, k_cache, v_cache, meta, scale=scale)
+
+    expected = torch.cat(
+        [_manual_padded_causal(q_per_req[i], k_per_req[i], v_per_req[i], seq_lens[i], scale=scale)
+         for i in range(len(seq_lens))],
+        dim=0,
+    )
+    # 只比对真实段（pad 段未写、is_padding 屏蔽）
+    torch.testing.assert_close(out[:actual_tokens], expected, rtol=1e-5, atol=1e-5)

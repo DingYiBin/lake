@@ -133,6 +133,48 @@ class InputBuffers:
         self.req_ids: List[str] = []
         self.num_reqs: int = 0
         self.num_tokens: int = 0
+        # P3.1 固定 shape padding：0=变长（effective=actual）；>0=pad 到固定值。
+        # materialize 已把 pad 区置好（is_padding=True / slot_mapping=-1 / qsl 非递减 /
+        # pad 行 seq_lens·block_table_lens=0）；此处只决定暴露给 forward 的 shape。
+        self._padded_num_reqs: int = 0
+        self._padded_num_tokens: int = 0
+
+    def set_padding(self, padded_num_reqs: int, padded_num_tokens: int) -> None:
+        """配置固定 shape padding（graph capture 地基）。
+
+        0/0=关（变长）；>0 时 forward 永远看到 padded shape，is_padding 区分真实/pad。
+        校验 ≤ max；materialize 时再校验 actual ≤ padded。
+        """
+        if (padded_num_reqs > 0) != (padded_num_tokens > 0):
+            raise ValueError(
+                "padded_num_reqs and padded_num_tokens must be both set or both 0"
+            )
+        if padded_num_reqs < 0 or padded_num_tokens < 0:
+            raise ValueError(
+                f"padded must be >= 0, got {padded_num_reqs}/{padded_num_tokens}"
+            )
+        if padded_num_reqs > self.max_num_reqs:
+            raise ValueError(
+                f"padded_num_reqs={padded_num_reqs} exceeds max_num_reqs={self.max_num_reqs}"
+            )
+        if padded_num_tokens > self.max_num_tokens:
+            raise ValueError(
+                f"padded_num_tokens={padded_num_tokens} exceeds max_num_tokens={self.max_num_tokens}"
+            )
+        self._padded_num_reqs = padded_num_reqs
+        self._padded_num_tokens = padded_num_tokens
+
+    @property
+    def padding_enabled(self) -> bool:
+        return self._padded_num_reqs > 0
+
+    @property
+    def effective_num_reqs(self) -> int:
+        return self._padded_num_reqs if self._padded_num_reqs > 0 else self.num_reqs
+
+    @property
+    def effective_num_tokens(self) -> int:
+        return self._padded_num_tokens if self._padded_num_tokens > 0 else self.num_tokens
 
     def _write_target(self, name: str) -> torch.Tensor:
         if self._stage is not None:
@@ -184,6 +226,12 @@ class InputBuffers:
         self.req_ids = list(batch.req_ids)
         self.num_reqs = len(batch.req_ids)
         cursor = 0
+        if self.padding_enabled:
+            if self.num_reqs > self._padded_num_reqs:
+                raise ValueError(
+                    f"num_reqs={self.num_reqs} exceeds padded_num_reqs="
+                    f"{self._padded_num_reqs}"
+                )
         slots = slot_mapping_by_req or {}
         tables = block_tables_by_req or {}
 
@@ -233,6 +281,12 @@ class InputBuffers:
         self.num_tokens = cursor
         for row in range(self.num_reqs + 1, self.max_num_reqs + 1):
             qsl[row] = cursor
+
+        if self.padding_enabled and self.num_tokens > self._padded_num_tokens:
+            raise ValueError(
+                f"num_tokens={self.num_tokens} exceeds padded_num_tokens="
+                f"{self._padded_num_tokens}"
+            )
 
         self._flush_staging()
         return self

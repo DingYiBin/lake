@@ -97,6 +97,33 @@ P3-for-lake ≠ 省 token H2D，而是 **把几何 packing（`positions`/`seq_le
 - P3-for-lake = 几何 device kernel → **graph-capture 使能器**。而 CUDA graph capture 本身标后置（D6），故 P3 是**前置使能、非独立热路径收益**。
 - 取舍：现在实现 = 前瞻投资（kernel 不上当前热路径，等 graph capture 落地才生效）；defer = 等 graph capture 提上日程时一并做（kernel 与 capture 形状/约束同设计更稳）。
 
+### P3.1 — 固定 shape padding（graph capture 地基，本轮做）
+
+> graph capture 的核心约束是**输入 shape 固定**：把 `num_reqs` / `num_tokens` pad 到配置的固定值，forward 永远看到同一形状，靠 `is_padding` mask 区分真实/pad。**本轮只做固定 shape 的 padding 基础设施，不实现 graph capture 本身**（graph 仍后置；本节是它的地基，也使 P3 几何 kernel 的形状约束提前钉死）。
+
+**参考实现**
+
+| 概念 | 路径:符号 |
+|------|-----------|
+| `num_reqs_after_padding` / `num_tokens_after_padding` | `vllm/v1/worker/gpu/input_batch.py:41,56`（InputBatch 字段） |
+| `is_padding` pad 段标记 | `vllm/v1/worker/gpu/model_runner.py:870-873`（`[:num_tokens]=False`、`[num_tokens:padded]=True`） |
+| `query_start_loc` 非递减 pad | `vllm/v1/worker/gpu/model_runner.py:924-929`（pad req 零长 query，尾段填 `num_tokens`） |
+| `num_reqs_padded` 驱动 forward shape | `vllm/v1/worker/gpu/model_states/default.py:148-149`（FULL graph 用 padded） |
+
+**lake 落点**
+
+- `RoleConfig`：加 `pad_num_reqs` / `pad_num_tokens`（0=变长/关；>0=pad 到固定值）+ env `LAKE_PAD_NUM_REQS` / `LAKE_PAD_NUM_TOKENS`；校验 ≤ `InputBuffers` max。
+- `InputBuffers`：`materialize` 已把 pad 区置好（`is_padding=True`、`slot_mapping=-1`、`query_start_loc` 非递减、pad 行 `seq_lens`/`block_table_lens`=0）。加 `set_padding(padded_num_reqs, padded_num_tokens)` + `effective_num_reqs` / `effective_num_tokens`（= padded 或 actual）。
+- `AttentionMetadata`：加 `padded_num_reqs` / `padded_num_tokens` / `is_padding`；`build_attn_metadata` 切到 **effective（padded）shape**——`num_reqs` / `num_actual_tokens` = padded（forward 形状），另加 `actual_num_reqs` / `actual_num_tokens`（sampler/host 用真实计数）。padding 关时 effective=actual，行为不变。
+- `ModelRunner`：构造期按 `RoleConfig` 调 `InputBuffers.set_padding`；`_forward_model` / `sample_tokens` 仍按 `batch.req_ids`（真实）迭代——pad 不产 logits；`is_padding` 供未来真实 forward 的 logits 收集用。
+- `CpuAttentionBackend.forward_varlen`：已跳过 `q_len<=0` 的 pad req（line 120-121），固定 shape 天然兼容。
+
+**不做**
+
+- 不实现 CUDA graph capture / replay（仍后置）。
+- 不做 device Triton pack kernel（P3 主体，待 graph capture 提日程）。
+- 不改 dummy/scheduler 路径的默认行为（padding 默认 off）。
+
 ## 不做
 
 - 把 host `Req` / 调度字典搬上 GPU  
@@ -112,3 +139,4 @@ P3-for-lake ≠ 省 token H2D，而是 **把几何 packing（`positions`/`seq_le
 | P1 AttentionMetadata | **done**（热路径 tensor + 2D `block_table`；FA2/Cpu 消费） |
 | P2 压缩 host `InputBatch` | **done**（行稠密 list 平行于 `req_ids`；`add_request` / `index_of`；materialize 按行迭代） |
 | P3 device pack | **设计 done**（vLLM 式省 H2D 不适用；lake 价值=几何 device kernel→graph-capture 使能器；graph capture 后置→P3 实现待 graph capture 提日程时一并做） |
+| P3.1 固定 shape padding | **done**（`RoleConfig.pad_num_reqs/tokens` + env；`InputBuffers.set_padding`/`effective_*`；`AttentionMetadata` padded shape + `is_padding` + `actual_*`；CPU 后端跳 pad req；默认 off，行为不变） |

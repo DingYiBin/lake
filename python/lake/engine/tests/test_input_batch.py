@@ -196,3 +196,165 @@ def test_inmemory_agent_returns_c11_tables() -> None:
     ready = ag.prepare_step(plan)
     assert ready.block_table_by_req["r1"] == [0, 1]
     assert ready.slot_mapping_by_req["r1"] == list(range(9))
+
+
+def test_input_buffers_padding_exposes_fixed_shape() -> None:
+    batch = InputBatch(
+        req_ids=["a", "b"],
+        token_ids=[[10, 11, 12, 13], [20, 21, 22]],
+        query_start=[1, 2],
+        query_end=[4, 3],
+    )
+    buffers = InputBuffers(max_num_reqs=8, max_num_tokens=16)
+    buffers.set_padding(padded_num_reqs=4, padded_num_tokens=8)
+    buffers.materialize(
+        batch,
+        slot_mapping_by_req={"a": [101, 102, 103], "b": [201]},
+        block_tables_by_req={"a": [0, 1], "b": [2]},
+    )
+    # actual 计数
+    assert buffers.num_reqs == 2
+    assert buffers.num_tokens == 4
+    # effective（padded）shape
+    assert buffers.effective_num_reqs == 4
+    assert buffers.effective_num_tokens == 8
+    assert buffers.padding_enabled is True
+    # is_padding mask：真实 4 个 False，pad 4 个 True
+    assert buffers.is_padding[:4].tolist() == [False, False, False, False]
+    assert buffers.is_padding[4:8].tolist() == [True, True, True, True]
+    # query_start_loc 非递减（pad req 零长 query，尾段填 num_tokens=4）
+    qsl = buffers.query_start_loc[:5].tolist()
+    assert qsl == [0, 3, 4, 4, 4]
+    assert all(qsl[i] <= qsl[i + 1] for i in range(len(qsl) - 1))
+    # pad 行 seq_lens / block_table_lens = 0
+    assert buffers.seq_lens[:4].tolist() == [4, 3, 0, 0]
+    assert buffers.block_table_lens[:4].tolist() == [2, 1, 0, 0]
+    # pad 段 slot_mapping = -1
+    assert buffers.slot_mapping[4:8].tolist() == [-1, -1, -1, -1]
+
+
+def test_build_attn_metadata_padded_shape() -> None:
+    batch = InputBatch(
+        req_ids=["a", "b"],
+        token_ids=[[10, 11, 12, 13], [20, 21, 22]],
+        query_start=[1, 2],
+        query_end=[4, 3],
+    )
+    buffers = InputBuffers(max_num_reqs=8, max_num_tokens=16)
+    buffers.set_padding(padded_num_reqs=4, padded_num_tokens=8)
+    buffers.materialize(
+        batch,
+        slot_mapping_by_req={"a": [101, 102, 103], "b": [201]},
+        block_tables_by_req={"a": [0, 1], "b": [2]},
+    )
+    meta = build_attn_metadata(
+        seq_lens={"a": 4, "b": 3},
+        query_start={"a": 1, "b": 2},
+        query_end={"a": 4, "b": 3},
+        block_tables={"a": [0, 1], "b": [2]},
+        buffers=buffers,
+        req_order=["a", "b"],
+    )
+    # forward shape = padded
+    assert meta.num_reqs == 4
+    assert meta.num_actual_tokens == 8
+    assert meta.padded_num_reqs == 4
+    assert meta.padded_num_tokens == 8
+    # sampler/host 真实计数
+    assert meta.actual_num_reqs == 2
+    assert meta.actual_num_tokens == 4
+    # is_padding mask
+    assert meta.is_padding.tolist() == [False, False, False, False, True, True, True, True]
+    # tensor 切到 padded
+    assert meta.query_start_loc.numel() == 5
+    assert meta.seq_lens_ordered.numel() == 4
+    assert meta.positions.numel() == 8
+
+
+def test_padding_rejects_actual_exceeding_padded() -> None:
+    batch = InputBatch(
+        req_ids=["a", "b", "c"],
+        token_ids=[[0], [1], [2]],
+        query_start=[0, 0, 0],
+        query_end=[1, 1, 1],
+    )
+    buffers = InputBuffers(max_num_reqs=8, max_num_tokens=16)
+    buffers.set_padding(padded_num_reqs=2, padded_num_tokens=8)
+    try:
+        buffers.materialize(batch)
+        raise AssertionError("expected ValueError for reqs > padded")
+    except ValueError as e:
+        assert "exceeds padded_num_reqs" in str(e)
+
+
+def test_padding_rejects_tokens_exceeding_padded() -> None:
+    batch = InputBatch(
+        req_ids=["a"],
+        token_ids=[list(range(10))],
+        query_start=[0],
+        query_end=[10],
+    )
+    buffers = InputBuffers(max_num_reqs=8, max_num_tokens=16)
+    buffers.set_padding(padded_num_reqs=4, padded_num_tokens=8)
+    try:
+        buffers.materialize(batch)
+        raise AssertionError("expected ValueError for tokens > padded")
+    except ValueError as e:
+        assert "exceeds padded_num_tokens" in str(e)
+
+
+def test_set_padding_validates_bounds() -> None:
+    buffers = InputBuffers(max_num_reqs=4, max_num_tokens=8)
+    try:
+        buffers.set_padding(padded_num_reqs=8, padded_num_tokens=4)
+        raise AssertionError("expected ValueError for reqs > max")
+    except ValueError as e:
+        assert "exceeds max_num_reqs" in str(e)
+    try:
+        buffers.set_padding(padded_num_reqs=4, padded_num_tokens=16)
+        raise AssertionError("expected ValueError for tokens > max")
+    except ValueError as e:
+        assert "exceeds max_num_tokens" in str(e)
+    try:
+        buffers.set_padding(padded_num_reqs=2, padded_num_tokens=0)
+        raise AssertionError("expected ValueError for both-or-zero")
+    except ValueError as e:
+        assert "both set or both 0" in str(e)
+
+
+def test_roleconfig_padding_validation() -> None:
+    from lake.engine.config.role import RoleConfig
+
+    RoleConfig(pad_num_reqs=0, pad_num_tokens=0)  # ok: off
+    RoleConfig(pad_num_reqs=4, pad_num_tokens=8)  # ok: both set
+    try:
+        RoleConfig(pad_num_reqs=4, pad_num_tokens=0)
+        raise AssertionError("expected ValueError for both-or-zero")
+    except ValueError as e:
+        assert "both set or both 0" in str(e)
+    try:
+        RoleConfig(pad_num_reqs=-1, pad_num_tokens=0)
+        raise AssertionError("expected ValueError for negative")
+    except ValueError as e:
+        assert ">= 0" in str(e)
+
+
+def test_roleconfig_padding_from_env() -> None:
+    import os
+    from lake.engine.config.role import RoleConfig
+
+    old_r = os.environ.pop("LAKE_PAD_NUM_REQS", None)
+    old_t = os.environ.pop("LAKE_PAD_NUM_TOKENS", None)
+    try:
+        os.environ["LAKE_PAD_NUM_REQS"] = "4"
+        os.environ["LAKE_PAD_NUM_TOKENS"] = "8"
+        role = RoleConfig.from_env()
+        assert role.pad_num_reqs == 4
+        assert role.pad_num_tokens == 8
+    finally:
+        os.environ.pop("LAKE_PAD_NUM_REQS", None)
+        os.environ.pop("LAKE_PAD_NUM_TOKENS", None)
+        if old_r is not None:
+            os.environ["LAKE_PAD_NUM_REQS"] = old_r
+        if old_t is not None:
+            os.environ["LAKE_PAD_NUM_TOKENS"] = old_t

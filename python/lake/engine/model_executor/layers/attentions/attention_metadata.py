@@ -51,6 +51,15 @@ class AttentionMetadata:
     num_reqs: int = 0
     num_actual_tokens: int = 0
     device: torch.device = field(default_factory=lambda: torch.device("cpu"))
+    # P3.1 固定 shape padding：forward 吃 padded shape（num_reqs/num_actual_tokens
+    # = padded），sampler/host 用 actual_*。padding 关时 padded=actual。
+    actual_num_reqs: int = 0
+    actual_num_tokens: int = 0
+    padded_num_reqs: int = 0
+    padded_num_tokens: int = 0
+    is_padding: torch.Tensor = field(
+        default_factory=lambda: torch.zeros(0, dtype=torch.bool)
+    )
 
 
 def build_attn_metadata(
@@ -76,8 +85,8 @@ def build_attn_metadata(
 
     if buffers is not None:
         # materialize 已把 seq_lens 行写成 query_end；runner 传入的 seq_lens dict 与之对齐。
-        n = buffers.num_reqs
-        nt = buffers.num_tokens
+        n = buffers.effective_num_reqs
+        nt = buffers.effective_num_tokens
         device = buffers.device
         return AttentionMetadata(
             seq_lens=dict(seq_lens),
@@ -94,6 +103,11 @@ def build_attn_metadata(
             max_query_len=max_q,
             num_reqs=n,
             num_actual_tokens=nt,
+            actual_num_reqs=buffers.num_reqs,
+            actual_num_tokens=buffers.num_tokens,
+            padded_num_reqs=n,
+            padded_num_tokens=nt,
+            is_padding=buffers.is_padding[:nt],
             device=device,
         )
 
@@ -124,6 +138,8 @@ def build_attn_metadata(
             bt[i, : len(row)] = torch.tensor(row, dtype=torch.int32)
         btl[i] = len(row)
 
+    actual_n = len(order)
+    actual_nt = qsl_list[-1] if qsl_list else 0
     return AttentionMetadata(
         seq_lens=dict(seq_lens),
         query_start=dict(query_start),
@@ -139,7 +155,12 @@ def build_attn_metadata(
         block_table_lens=btl,
         max_seq_len=max_seq,
         max_query_len=max_q,
-        num_reqs=len(order),
-        num_actual_tokens=qsl_list[-1] if qsl_list else 0,
+        num_reqs=actual_n,
+        num_actual_tokens=actual_nt,
+        actual_num_reqs=actual_n,
+        actual_num_tokens=actual_nt,
+        padded_num_reqs=actual_n,
+        padded_num_tokens=actual_nt,
+        is_padding=torch.zeros(actual_nt, dtype=torch.bool),
         device=torch.device("cpu"),
     )

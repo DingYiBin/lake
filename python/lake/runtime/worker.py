@@ -80,6 +80,8 @@ class WorkerServicer(lake_pb2_grpc.WorkerServiceServicer):
         self._runner = ModelRunner(
             self._pool,
             attn_backend_name=self._role.attn_backend_name,
+            pad_num_reqs=self._role.pad_num_reqs,
+            pad_num_tokens=self._role.pad_num_tokens,
         )
         self._engine = WorkerEngine(self._pool, self._runner, self._role)
         if start_engine:
