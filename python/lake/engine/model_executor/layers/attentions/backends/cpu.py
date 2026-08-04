@@ -107,24 +107,27 @@ class CpuAttentionBackend:
         qsl = attn_meta.query_start_loc
         seq_lens = attn_meta.seq_lens_ordered
         tables = attn_meta.block_table_tensor
-        if len(qsl) - 1 != len(tables) or len(seq_lens) != len(tables):
+        table_lens = attn_meta.block_table_lens
+        n_req = int(attn_meta.num_reqs)
+        if qsl.numel() != n_req + 1 or seq_lens.numel() != n_req or tables.size(0) != n_req:
             raise ValueError(
                 "inconsistent metadata: query_start_loc/block_table_tensor/seq_lens_ordered"
             )
-        for i in range(len(tables)):
-            q_start = qsl[i]
-            q_end = qsl[i + 1]
+        for i in range(n_req):
+            q_start = int(qsl[i].item())
+            q_end = int(qsl[i + 1].item())
             q_len = q_end - q_start
             if q_len <= 0:
                 continue
-            seq_len = seq_lens[i]
+            seq_len = int(seq_lens[i].item())
             if seq_len <= 0:
                 raise ValueError(f"req {i}: seq_len={seq_len} but q_len={q_len}")
             # block 级 block_table → token 级 slot 列表（取前 seq_len 个 token）
-            table = tables[i]
+            n_blocks = int(table_lens[i].item()) if table_lens.numel() else tables.size(1)
+            table = tables[i, :n_blocks]
             slots = torch.empty(seq_len, dtype=torch.long, device=k_cache.device)
             for t in range(seq_len):
-                blk = table[t // block_size]
+                blk = int(table[t // block_size].item())
                 slots[t] = blk * block_size + (t % block_size)
             k_i = k_cache[slots]  # [seq_len, num_kv_heads, head_dim]
             v_i = v_cache[slots]

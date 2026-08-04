@@ -44,10 +44,11 @@ def test_prepare_inputs_attn_metadata() -> None:
     meta = runner.prepare_attn(batch, ready)
     assert meta.block_tables["r"] == [0, 1]
     assert meta.max_query_len == 3
-    assert meta.query_start_loc == [0, 3]
-    assert meta.positions == [2, 3, 4]
-    assert meta.slot_mapping == [2, 3, 4]
-    assert meta.block_table_tensor == [[0, 1]]
+    assert meta.query_start_loc.tolist() == [0, 3]
+    assert meta.positions.tolist() == [2, 3, 4]
+    assert meta.slot_mapping.tolist() == [2, 3, 4]
+    assert meta.block_table_lens.tolist() == [2]
+    assert meta.block_table_tensor[0, :2].tolist() == [0, 1]
 
 
 def test_decode_slot_mapping_matches_query_position() -> None:
@@ -73,8 +74,8 @@ def test_decode_slot_mapping_matches_query_position() -> None:
         slot_mapping_by_req={"r": [3]},
     )
     meta = runner.prepare_attn(batch, ready)
-    assert meta.positions == [3]
-    assert meta.slot_mapping == [3]
+    assert meta.positions.tolist() == [3]
+    assert meta.slot_mapping.tolist() == [3]
 
 
 def test_prepare_inputs_uses_scheduler_query_geometry_under_overlap() -> None:
@@ -104,8 +105,8 @@ def test_prepare_inputs_uses_scheduler_query_geometry_under_overlap() -> None:
         slot_mapping_by_req={"r": [4]},
     )
     meta = runner.prepare_attn(batch, ready)
-    assert meta.positions == [4]
-    assert meta.slot_mapping == [4]
+    assert meta.positions.tolist() == [4]
+    assert meta.slot_mapping.tolist() == [4]
 
 
 def test_two_reqs_same_batch() -> None:
@@ -137,7 +138,7 @@ def test_build_attn_metadata_loc() -> None:
         query_end={"a": 5, "b": 3},
         req_order=["a", "b"],
     )
-    assert meta.query_start_loc == [0, 3, 4]
+    assert meta.query_start_loc.tolist() == [0, 3, 4]
     assert meta.max_query_len == 3
 
 
@@ -149,14 +150,21 @@ def test_input_buffers_materialize_ragged_queries() -> None:
         query_end={"a": 4, "b": 3},
     )
     buffers = InputBuffers(max_num_reqs=4, max_num_tokens=8)
-    buffers.materialize(batch, slot_mapping_by_req={"a": [101, 102, 103], "b": [201]})
+    buffers.materialize(
+        batch,
+        slot_mapping_by_req={"a": [101, 102, 103], "b": [201]},
+        block_tables_by_req={"a": [0, 1], "b": [2]},
+    )
     assert buffers.num_reqs == 2
     assert buffers.num_tokens == 4
-    assert buffers.query_start_loc[:3] == [0, 3, 4]
-    assert buffers.input_ids[:4] == [11, 12, 13, 22]
-    assert buffers.positions[:4] == [1, 2, 3, 2]
-    assert buffers.slot_mapping[:4] == [101, 102, 103, 201]
-    assert buffers.is_padding[:4] == [False, False, False, False]
+    assert buffers.query_start_loc[:3].tolist() == [0, 3, 4]
+    assert buffers.input_ids[:4].tolist() == [11, 12, 13, 22]
+    assert buffers.positions[:4].tolist() == [1, 2, 3, 2]
+    assert buffers.slot_mapping[:4].tolist() == [101, 102, 103, 201]
+    assert buffers.is_padding[:4].tolist() == [False, False, False, False]
+    assert buffers.block_table_lens[:2].tolist() == [2, 1]
+    assert buffers.block_table[0, :2].tolist() == [0, 1]
+    assert buffers.block_table[1, :1].tolist() == [2]
 
 
 def test_build_attn_metadata_rejects_bad_slot_mapping() -> None:

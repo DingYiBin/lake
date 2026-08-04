@@ -1,13 +1,21 @@
 """本步静态 / 批 buffer（非跨步请求权威）。
 
-对齐 vLLM V2 `InputBatch` 子集：本步 token 几何 + 供 attn 的上下文切片。
-Host `Req` 权威仍在 `node_scheduler`。
+对齐 vLLM V2 ``InputBatch`` / ``InputBuffers`` 子集：
+- ``InputBatch``：host 轻量几何（req_ids / dict），供 materialize
+- ``InputBuffers``：预分配 **device tensor**（固定地址）；CUDA 经 pin staging H2D
+
+Host ``Req`` 权威仍在 ``node_scheduler``。计划见
+``docs/architecture/input-batch-device.md``。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Optional, Union
+
+import torch
+
+DeviceLike = Union[str, torch.device]
 
 
 @dataclass
@@ -32,63 +40,108 @@ class InputBatch:
         self.is_prompt_phase.clear()
 
 
-@dataclass
 class InputBuffers:
-    """C11 静态 buffer 镜像。
+    """固定地址执行 buffer（对齐 vLLM V2 ``InputBuffers``）。
 
-    生产会替换为固定地址 device tensor；当前用 list 保持纯 Python 单测。
-    内容按 query-only 展开，对齐 vLLM `InputBuffers` 的职责边界。
+    热路径字段为 device tensor；``device=cpu`` 时直接写入，便于单测。
+    ``device=cuda`` 时先写 pin staging，再 ``non_blocking`` H2D。
     """
 
-    max_num_reqs: int
-    max_num_tokens: int
-    input_ids: List[int] = field(init=False)
-    positions: List[int] = field(init=False)
-    query_start_loc: List[int] = field(init=False)
-    seq_lens: List[int] = field(init=False)
-    is_padding: List[bool] = field(init=False)
-    slot_mapping: List[int] = field(init=False)
-    req_ids: List[str] = field(default_factory=list)
-    num_reqs: int = 0
-    num_tokens: int = 0
-
-    def __post_init__(self) -> None:
-        if self.max_num_reqs <= 0:
+    def __init__(
+        self,
+        max_num_reqs: int,
+        max_num_tokens: int,
+        *,
+        device: DeviceLike = "cpu",
+        max_num_blocks: int = 256,
+    ) -> None:
+        if max_num_reqs <= 0:
             raise ValueError("max_num_reqs must be > 0")
-        if self.max_num_tokens <= 0:
+        if max_num_tokens <= 0:
             raise ValueError("max_num_tokens must be > 0")
-        self.input_ids = [0] * self.max_num_tokens
-        self.positions = [0] * self.max_num_tokens
-        self.query_start_loc = [0] * (self.max_num_reqs + 1)
-        self.seq_lens = [0] * self.max_num_reqs
-        self.is_padding = [True] * self.max_num_tokens
-        self.slot_mapping = [-1] * self.max_num_tokens
+        if max_num_blocks <= 0:
+            raise ValueError("max_num_blocks must be > 0")
+
+        self.max_num_reqs = max_num_reqs
+        self.max_num_tokens = max_num_tokens
+        self.max_num_blocks = max_num_blocks
+        self.device = torch.device(device)
+        self._use_staging = self.device.type == "cuda"
+
+        def _dev(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+            return torch.zeros(shape, dtype=dtype, device=self.device)
+
+        self.input_ids = _dev((max_num_tokens,), torch.int32)
+        self.positions = _dev((max_num_tokens,), torch.int64)
+        self.is_padding = torch.ones(max_num_tokens, dtype=torch.bool, device=self.device)
+        self.query_start_loc = _dev((max_num_reqs + 1,), torch.int32)
+        self.seq_lens = _dev((max_num_reqs,), torch.int32)
+        self.slot_mapping = torch.full(
+            (max_num_tokens,), -1, dtype=torch.int32, device=self.device
+        )
+        self.block_table = _dev((max_num_reqs, max_num_blocks), torch.int32)
+        self.block_table_lens = _dev((max_num_reqs,), torch.int32)
+
+        self._stage: Optional[dict[str, torch.Tensor]] = None
+        if self._use_staging:
+            pin = dict(device="cpu", pin_memory=True)
+            self._stage = {
+                "input_ids": torch.zeros(max_num_tokens, dtype=torch.int32, **pin),
+                "positions": torch.zeros(max_num_tokens, dtype=torch.int64, **pin),
+                "is_padding": torch.ones(max_num_tokens, dtype=torch.bool, **pin),
+                "query_start_loc": torch.zeros(max_num_reqs + 1, dtype=torch.int32, **pin),
+                "seq_lens": torch.zeros(max_num_reqs, dtype=torch.int32, **pin),
+                "slot_mapping": torch.full((max_num_tokens,), -1, dtype=torch.int32, **pin),
+                "block_table": torch.zeros(
+                    max_num_reqs, max_num_blocks, dtype=torch.int32, **pin
+                ),
+                "block_table_lens": torch.zeros(max_num_reqs, dtype=torch.int32, **pin),
+            }
+
+        self.req_ids: List[str] = []
+        self.num_reqs: int = 0
+        self.num_tokens: int = 0
+
+    def _write_target(self, name: str) -> torch.Tensor:
+        if self._stage is not None:
+            return self._stage[name]
+        return getattr(self, name)
 
     def clear(self) -> None:
         self.req_ids = []
         self.num_reqs = 0
         self.num_tokens = 0
-        for i in range(self.max_num_reqs + 1):
-            self.query_start_loc[i] = 0
-        for i in range(self.max_num_reqs):
-            self.seq_lens[i] = 0
-        for i in range(self.max_num_tokens):
-            self.input_ids[i] = 0
-            self.positions[i] = 0
-            self.is_padding[i] = True
-            self.slot_mapping[i] = -1
+        tgt_qsl = self._write_target("query_start_loc")
+        tgt_seq = self._write_target("seq_lens")
+        tgt_ids = self._write_target("input_ids")
+        tgt_pos = self._write_target("positions")
+        tgt_pad = self._write_target("is_padding")
+        tgt_slot = self._write_target("slot_mapping")
+        tgt_bt = self._write_target("block_table")
+        tgt_btl = self._write_target("block_table_lens")
+        tgt_qsl.zero_()
+        tgt_seq.zero_()
+        tgt_ids.zero_()
+        tgt_pos.zero_()
+        tgt_pad.fill_(True)
+        tgt_slot.fill_(-1)
+        tgt_bt.zero_()
+        tgt_btl.zero_()
+
+    def _flush_staging(self) -> None:
+        if self._stage is None:
+            return
+        for name, staged in self._stage.items():
+            getattr(self, name).copy_(staged, non_blocking=True)
 
     def materialize(
         self,
         batch: InputBatch,
         *,
         slot_mapping_by_req: Dict[str, List[int]] | None = None,
+        block_tables_by_req: Dict[str, List[int]] | None = None,
     ) -> "InputBuffers":
-        """把 `InputBatch` 写入静态 buffer。
-
-        `slot_mapping_by_req` 由 agent 提供。缺省时用 token 绝对位置做逻辑镜像，
-        只服务单测；生产必须由 agent 写真实 slot。
-        """
+        """把 ``InputBatch``（+ agent 表）写入静态 buffer。"""
 
         if len(batch.req_ids) > self.max_num_reqs:
             raise ValueError(
@@ -100,6 +153,17 @@ class InputBuffers:
         self.num_reqs = len(batch.req_ids)
         cursor = 0
         slots = slot_mapping_by_req or {}
+        tables = block_tables_by_req or {}
+
+        qsl = self._write_target("query_start_loc")
+        seq = self._write_target("seq_lens")
+        ids = self._write_target("input_ids")
+        pos = self._write_target("positions")
+        pad = self._write_target("is_padding")
+        smap = self._write_target("slot_mapping")
+        bt = self._write_target("block_table")
+        btl = self._write_target("block_table_lens")
+
         for row, req_id in enumerate(batch.req_ids):
             qs = batch.query_start[req_id]
             qe = batch.query_end[req_id]
@@ -108,8 +172,8 @@ class InputBuffers:
                 raise ValueError(
                     f"num_tokens={cursor + q_len} exceeds max_num_tokens={self.max_num_tokens}"
                 )
-            self.query_start_loc[row] = cursor
-            self.seq_lens[row] = qe
+            qsl[row] = cursor
+            seq[row] = qe
             tokens = batch.token_ids[req_id][qs:qe]
             req_slots = slots.get(req_id)
             if req_slots is not None and len(req_slots) != q_len:
@@ -118,16 +182,25 @@ class InputBuffers:
                 )
             for j, token in enumerate(tokens):
                 idx = cursor + j
-                self.input_ids[idx] = int(token)
-                self.positions[idx] = qs + j
-                self.is_padding[idx] = False
-                self.slot_mapping[idx] = (
-                    int(req_slots[j]) if req_slots is not None else qs + j
+                ids[idx] = int(token)
+                pos[idx] = qs + j
+                pad[idx] = False
+                smap[idx] = int(req_slots[j]) if req_slots is not None else qs + j
+
+            table = tables.get(req_id) or []
+            if len(table) > self.max_num_blocks:
+                raise ValueError(
+                    f"block_table len={len(table)} exceeds max_num_blocks={self.max_num_blocks}"
                 )
+            if table:
+                bt[row, : len(table)] = torch.tensor(table, dtype=torch.int32)
+            btl[row] = len(table)
             cursor += q_len
 
-        self.query_start_loc[self.num_reqs] = cursor
+        qsl[self.num_reqs] = cursor
         self.num_tokens = cursor
         for row in range(self.num_reqs + 1, self.max_num_reqs + 1):
-            self.query_start_loc[row] = cursor
+            qsl[row] = cursor
+
+        self._flush_staging()
         return self

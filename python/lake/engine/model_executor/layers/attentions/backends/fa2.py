@@ -76,18 +76,18 @@ class FlashAttn2Backend:
 
         B = attn_meta.num_reqs
         device = q.device
-        cu_seqlens_q = torch.tensor(attn_meta.query_start_loc, dtype=torch.int32, device=device)
-        # cu_seqlens_k = 前缀和(seq_lens_ordered)
-        seq_lens = attn_meta.seq_lens_ordered
+        cu_seqlens_q = attn_meta.query_start_loc.to(device=device, dtype=torch.int32)
+        seq_lens = attn_meta.seq_lens_ordered.to(device=device, dtype=torch.int32)
         cu_seqlens_k = torch.zeros(B + 1, dtype=torch.int32, device=device)
-        for i in range(B):
-            cu_seqlens_k[i + 1] = cu_seqlens_k[i] + seq_lens[i]
-        # block_table pad 到 2D [B, max_num_blocks]
-        tables = attn_meta.block_table_tensor
-        max_blocks = max((len(t) for t in tables), default=0) if B else 0
-        block_table = torch.zeros(B, max_blocks, dtype=torch.int32, device=device)
-        for i, t in enumerate(tables):
-            block_table[i, :len(t)] = torch.tensor(t, dtype=torch.int32, device=device)
+        if B > 0:
+            torch.cumsum(seq_lens, dim=0, out=cu_seqlens_k[1:])
+        # 固定地址 2D block_table（P1）；按 lens 截有效列宽
+        tables = attn_meta.block_table_tensor.to(device=device, dtype=torch.int32)
+        if B == 0:
+            block_table = tables
+        else:
+            max_blocks = int(attn_meta.block_table_lens.max().item()) if B else 0
+            block_table = tables[:, : max(max_blocks, 1)]
 
         return flash_attn_varlen_func(
             q, k, v,

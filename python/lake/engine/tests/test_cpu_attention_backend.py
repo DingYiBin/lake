@@ -162,16 +162,24 @@ def _meta(
     qsl = [0]
     for ql in q_lens:
         qsl.append(qsl[-1] + ql)
+    max_blocks = max((len(t) for t in tables), default=0)
+    bt = torch.zeros(len(tables), max(max_blocks, 1), dtype=torch.int32)
+    btl = torch.zeros(len(tables), dtype=torch.int32)
+    for i, row in enumerate(tables):
+        if row:
+            bt[i, : len(row)] = torch.tensor(row, dtype=torch.int32)
+        btl[i] = len(row)
     return AttentionMetadata(
         seq_lens={str(i): s for i, s in enumerate(seq_lens)},
         query_start={str(i): seq_lens[i] - q_lens[i] for i in range(len(seq_lens))},
         query_end={str(i): seq_lens[i] for i in range(len(seq_lens))},
         block_tables={str(i): tables[i] for i in range(len(tables))},
-        block_table_tensor=tables,
-        slot_mapping=[],
-        positions=[],
-        query_start_loc=qsl,
-        seq_lens_ordered=list(seq_lens),
+        block_table_tensor=bt,
+        block_table_lens=btl,
+        slot_mapping=torch.zeros(0, dtype=torch.int32),
+        positions=torch.zeros(0, dtype=torch.int64),
+        query_start_loc=torch.tensor(qsl, dtype=torch.int32),
+        seq_lens_ordered=torch.tensor(seq_lens, dtype=torch.int32),
         max_seq_len=max(seq_lens) if seq_lens else 0,
         max_query_len=max(q_lens) if q_lens else 0,
         num_reqs=len(seq_lens),

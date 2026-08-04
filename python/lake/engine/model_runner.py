@@ -233,7 +233,9 @@ class ModelRunner:
         for rid in batch.req_ids:
             seq_lens[rid] = batch.query_end[rid]
         self._input_buffers.materialize(
-            batch, slot_mapping_by_req=ready.slot_mapping_by_req
+            batch,
+            slot_mapping_by_req=ready.slot_mapping_by_req,
+            block_tables_by_req=ready.block_table_by_req,
         )
         meta = build_attn_metadata(
             seq_lens=seq_lens,

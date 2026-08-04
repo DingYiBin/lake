@@ -1,13 +1,16 @@
-"""AttentionMetadata（D4 / C8）。
+"""AttentionMetadata（D4 / C8 / device 化 P1）。
 
-对照 vLLM `AttentionMetadata` / `AttentionMetadataBuilder`：
-runner 填 seq/query 几何；**block table 由 agent 经 ReadyHandle 挂载**，引擎只读。
+对照 vLLM ``AttentionMetadata``：runner 填 seq/query 几何；
+**block table 由 agent 经 ReadyHandle 挂载**，引擎只读。
+热路径字段为 device tensor（见 ``docs/architecture/input-batch-device.md``）。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
+
+import torch
 
 from lake.engine.input_batch import InputBuffers
 
@@ -16,27 +19,38 @@ from lake.engine.input_batch import InputBuffers
 class AttentionMetadata:
     """本步 attention 输入（无物理地址权威）。"""
 
-    # 每请求：已有 KV 长度（token），半开上界 = num_computed
+    # host 控制视图（按 req_id）
     seq_lens: Dict[str, int] = field(default_factory=dict)
-    # 每请求：本步 query 区间 [query_start, query_end)
     query_start: Dict[str, int] = field(default_factory=dict)
     query_end: Dict[str, int] = field(default_factory=dict)
-    # agent 组装的逻辑 block table（slot 索引）；生产为固定地址 tensor 的镜像/句柄
     block_tables: Dict[str, List[int]] = field(default_factory=dict)
-    # C11：按 req_order 排列的 block table 镜像（生产对应固定地址 tensor）
-    block_table_tensor: List[List[int]] = field(default_factory=list)
-    # C11：本步 query token → write slot 的镜像；生产对应固定地址 tensor
-    slot_mapping: List[int] = field(default_factory=list)
-    # C11：query token 的绝对 position
-    positions: List[int] = field(default_factory=list)
-    # 批级：ragged 拼接时的前缀和（预留真批融合）
-    query_start_loc: List[int] = field(default_factory=list)
-    # C11+：按 req_order 排列的 seq_lens（与 block_table_tensor 同序），供 varlen 后端按位置读
-    seq_lens_ordered: List[int] = field(default_factory=list)
+
+    # device / cpu tensor 热路径（与 req_order 对齐）
+    query_start_loc: torch.Tensor = field(
+        default_factory=lambda: torch.zeros(1, dtype=torch.int32)
+    )
+    seq_lens_ordered: torch.Tensor = field(
+        default_factory=lambda: torch.zeros(0, dtype=torch.int32)
+    )
+    slot_mapping: torch.Tensor = field(
+        default_factory=lambda: torch.zeros(0, dtype=torch.int32)
+    )
+    positions: torch.Tensor = field(
+        default_factory=lambda: torch.zeros(0, dtype=torch.int64)
+    )
+    # [num_reqs, max_blocks]；有效长度见 block_table_lens
+    block_table_tensor: torch.Tensor = field(
+        default_factory=lambda: torch.zeros(0, 0, dtype=torch.int32)
+    )
+    block_table_lens: torch.Tensor = field(
+        default_factory=lambda: torch.zeros(0, dtype=torch.int32)
+    )
+
     max_seq_len: int = 0
     max_query_len: int = 0
     num_reqs: int = 0
     num_actual_tokens: int = 0
+    device: torch.device = field(default_factory=lambda: torch.device("cpu"))
 
 
 def build_attn_metadata(
@@ -50,43 +64,82 @@ def build_attn_metadata(
     req_order: Optional[List[str]] = None,
 ) -> AttentionMetadata:
     order = req_order or list(seq_lens.keys())
-    qsl = [0]
+    tables = block_tables or {}
     max_seq = 0
     max_q = 0
-    flat_slots: List[int] = []
-    positions: List[int] = []
-    tables = block_tables or {}
     for rid in order:
         qs = query_start.get(rid, 0)
         qe = query_end.get(rid, qs)
         q_len = max(0, qe - qs)
-        qsl.append(qsl[-1] + q_len)
         max_seq = max(max_seq, seq_lens.get(rid, 0))
         max_q = max(max_q, q_len)
-        if buffers is None:
-            req_slots = (slot_mapping_by_req or {}).get(rid)
-            if req_slots is not None and len(req_slots) != q_len:
-                raise ValueError(
-                    f"slot_mapping len mismatch req={rid}: {len(req_slots)} != {q_len}"
-                )
-            flat_slots.extend(req_slots if req_slots is not None else range(qs, qe))
-            positions.extend(range(qs, qe))
+
     if buffers is not None:
-        flat_slots = list(buffers.slot_mapping[: buffers.num_tokens])
-        positions = list(buffers.positions[: buffers.num_tokens])
-        qsl = list(buffers.query_start_loc[: buffers.num_reqs + 1])
+        # materialize 已把 seq_lens 行写成 query_end；runner 传入的 seq_lens dict 与之对齐。
+        n = buffers.num_reqs
+        nt = buffers.num_tokens
+        device = buffers.device
+        return AttentionMetadata(
+            seq_lens=dict(seq_lens),
+            query_start=dict(query_start),
+            query_end=dict(query_end),
+            block_tables=dict(tables),
+            query_start_loc=buffers.query_start_loc[: n + 1],
+            seq_lens_ordered=buffers.seq_lens[:n],
+            slot_mapping=buffers.slot_mapping[:nt],
+            positions=buffers.positions[:nt],
+            block_table_tensor=buffers.block_table[:n],
+            block_table_lens=buffers.block_table_lens[:n],
+            max_seq_len=max_seq,
+            max_query_len=max_q,
+            num_reqs=n,
+            num_actual_tokens=nt,
+            device=device,
+        )
+
+    # 无 buffer：在 CPU 上现建（单测 / 轻路径）
+    qsl_list = [0]
+    flat_slots: List[int] = []
+    positions: List[int] = []
+    table_rows: List[List[int]] = []
+    for rid in order:
+        qs = query_start.get(rid, 0)
+        qe = query_end.get(rid, qs)
+        q_len = max(0, qe - qs)
+        qsl_list.append(qsl_list[-1] + q_len)
+        req_slots = (slot_mapping_by_req or {}).get(rid)
+        if req_slots is not None and len(req_slots) != q_len:
+            raise ValueError(
+                f"slot_mapping len mismatch req={rid}: {len(req_slots)} != {q_len}"
+            )
+        flat_slots.extend(req_slots if req_slots is not None else range(qs, qe))
+        positions.extend(range(qs, qe))
+        table_rows.append(list(tables.get(rid, [])))
+
+    max_blocks = max((len(t) for t in table_rows), default=0)
+    bt = torch.zeros(len(order), max(max_blocks, 1), dtype=torch.int32)
+    btl = torch.zeros(len(order), dtype=torch.int32)
+    for i, row in enumerate(table_rows):
+        if row:
+            bt[i, : len(row)] = torch.tensor(row, dtype=torch.int32)
+        btl[i] = len(row)
+
     return AttentionMetadata(
         seq_lens=dict(seq_lens),
         query_start=dict(query_start),
         query_end=dict(query_end),
         block_tables=dict(tables),
-        block_table_tensor=[list(tables.get(rid, [])) for rid in order],
-        slot_mapping=flat_slots,
-        positions=positions,
-        query_start_loc=qsl,
-        seq_lens_ordered=[seq_lens.get(rid, 0) for rid in order],
+        query_start_loc=torch.tensor(qsl_list, dtype=torch.int32),
+        seq_lens_ordered=torch.tensor(
+            [seq_lens.get(rid, 0) for rid in order], dtype=torch.int32
+        ),
+        slot_mapping=torch.tensor(flat_slots, dtype=torch.int32),
+        positions=torch.tensor(positions, dtype=torch.int64),
+        block_table_tensor=bt if order else torch.zeros(0, 0, dtype=torch.int32),
+        block_table_lens=btl,
         max_seq_len=max_seq,
         max_query_len=max_q,
         num_reqs=len(order),
-        num_actual_tokens=qsl[-1] if qsl else 0,
+        num_actual_tokens=qsl_list[-1] if qsl_list else 0,
+        device=torch.device("cpu"),
     )
