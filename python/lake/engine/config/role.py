@@ -19,8 +19,12 @@ class WorkerRole(str, Enum):
 @dataclass
 class RoleConfig:
     role: WorkerRole = WorkerRole.HYBRID
-    enable_drafter: bool = False  # 保留给后续真实 draft/spec 模型；当前未接入
-    num_draft_tokens: int = 2  # C4：MTP 宽度（当前未接入）
+    # C4：MTP 宽度。0=不接 drafter（默认）；>0=每步 draft 这么多 token。
+    # 是否启用 drafter 由 ``num_draft_tokens > 0`` 推导（见 ``drafter_enabled``），
+    # 不另设 enable 开关——对齐 vLLM（``speculative_config is not None``）/ SGLang
+    # （``speculative_algorithm is not None``）以「配置存在性」为闸门的风格。
+    # 真实 spec 落地时再加 ``draft_algorithm``/``draft_method`` 字段当主闸门。
+    num_draft_tokens: int = 0
     enable_overlap: bool = True  # 默认开；对齐 SGLang event_loop_overlap
     max_running_reqs: int = 8  # continuous batching 上限（C1）
     # C7：对齐 vLLM Scheduler.token_budget / long_prefill_token_threshold
@@ -62,6 +66,10 @@ class RoleConfig:
             raise ValueError(
                 f"warmup_tokens_per_req must be > 0, got {self.warmup_tokens_per_req}"
             )
+        if self.num_draft_tokens < 0:
+            raise ValueError(
+                f"num_draft_tokens must be >= 0, got {self.num_draft_tokens}"
+            )
         if self.pad_num_reqs < 0 or self.pad_num_tokens < 0:
             raise ValueError(
                 f"pad_num_reqs/pad_num_tokens must be >= 0, got "
@@ -72,12 +80,17 @@ class RoleConfig:
                 "pad_num_reqs and pad_num_tokens must be both set or both 0"
             )
 
+    @property
+    def drafter_enabled(self) -> bool:
+        """是否启用 drafter：``num_draft_tokens > 0`` 即开。"""
+        return self.num_draft_tokens > 0
+
     @classmethod
     def from_env(cls) -> "RoleConfig":
         """C6/D3 + C7：从环境变量读启动配置。
 
         LAKE_WORKER_ROLE=prefill|decode|hybrid
-        LAKE_ENABLE_DRAFTER / LAKE_ENABLE_OVERLAP / LAKE_ALLOW_PARTIAL_HIT
+        LAKE_ENABLE_OVERLAP / LAKE_ALLOW_PARTIAL_HIT
         LAKE_NUM_DRAFT_TOKENS / LAKE_MAX_RUNNING_REQS / LAKE_PULL_BUDGET_MS
         LAKE_MAX_NUM_SCHEDULED_TOKENS / LAKE_LONG_PREFILL_TOKEN_THRESHOLD
         LAKE_MAX_MODEL_LENGTH
@@ -101,10 +114,9 @@ class RoleConfig:
             served_model_name=os.environ.get("LAKE_SERVED_MODEL_NAME", "model").strip()
             or "model",
             model_revision=os.environ.get("LAKE_MODEL_REVISION", "").strip(),
-            enable_drafter=env_bool("LAKE_ENABLE_DRAFTER", False),
             enable_overlap=env_bool("LAKE_ENABLE_OVERLAP", True),
             allow_partial_hit=env_bool("LAKE_ALLOW_PARTIAL_HIT", False),
-            num_draft_tokens=env_int("LAKE_NUM_DRAFT_TOKENS", 2),
+            num_draft_tokens=env_int("LAKE_NUM_DRAFT_TOKENS", 0),
             max_running_reqs=env_int("LAKE_MAX_RUNNING_REQS", 8),
             max_num_scheduled_tokens=env_int("LAKE_MAX_NUM_SCHEDULED_TOKENS", 8192),
             long_prefill_token_threshold=env_int("LAKE_LONG_PREFILL_TOKEN_THRESHOLD", 0),

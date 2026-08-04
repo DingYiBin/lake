@@ -10,6 +10,7 @@ from typing import Any, Optional
 
 from transformers import Qwen3Config
 
+from lake.engine.config.role import RoleConfig
 from lake.engine.model_runner import ModelRunner
 
 
@@ -38,11 +39,13 @@ def make_runner(
     *,
     load: bool = True,
     model_config: Optional[Any] = None,
+    role: Optional[RoleConfig] = None,
     **runner_kwargs: Any,
 ) -> ModelRunner:
     """Construct a ModelRunner with tiny config; optionally ``load_format=dummy``."""
     runner = ModelRunner(
         pool,
+        role=role or RoleConfig(),
         model_config=model_config or tiny_qwen3_config(),
         **runner_kwargs,
     )

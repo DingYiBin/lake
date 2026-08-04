@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 import torch
 
+from lake.engine.config.role import RoleConfig
 from lake.engine.model_executor.layers.attentions import (
     AttentionMetadata,
     build_attn_backend,
@@ -62,23 +63,27 @@ class ModelRunner:
         self,
         pool: PoolIface,
         *,
-        attn_backend_name: str = "cpu",
+        role: RoleConfig,
         model_config: Optional[Any] = None,
         weight_pin_callback: Optional[Callable[[ModelLoadInfo], None]] = None,
-        pad_num_reqs: int = 0,
-        pad_num_tokens: int = 0,
     ) -> None:
         self._pool = pool
+        self._role = role
         self._input_batch = InputBatch()
-        self._input_buffers = InputBuffers(max_num_reqs=64, max_num_tokens=8192)
+        # InputBuffers 容量来自 role（C1 max_running_reqs / C7 max_num_scheduled_tokens），
+        # 不再写死——runner 的几何上限即 role 的几何上限。
+        self._input_buffers = InputBuffers(
+            max_num_reqs=role.max_running_reqs,
+            max_num_tokens=role.max_num_scheduled_tokens,
+        )
         # P3.1 固定 shape padding（graph capture 地基）：>0 时 forward 吃 padded shape。
-        if pad_num_reqs > 0 or pad_num_tokens > 0:
-            self._input_buffers.set_padding(pad_num_reqs, pad_num_tokens)
+        if role.pad_num_reqs > 0 or role.pad_num_tokens > 0:
+            self._input_buffers.set_padding(role.pad_num_reqs, role.pad_num_tokens)
         self._attn_meta: Optional[AttentionMetadata] = None
         # attention 后端实例：runner 经注册表 ``build_attn_backend`` 建一次，沿模型树
         # 构造期注入到每个 ``Qwen3PagedAttention``——模型层不 import 任何具体后端
         # （对齐 vLLM ``Attention``/SGLang ``RadixAttention``：后端由 runner 选定注入）。
-        self._attn_backend = build_attn_backend(attn_backend_name)
+        self._attn_backend = build_attn_backend(role.attn_backend_name)
         self._config_override = model_config
         self._model: Optional[Any] = None
         self._architecture = ""

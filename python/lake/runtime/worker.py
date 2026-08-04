@@ -77,12 +77,7 @@ class WorkerServicer(lake_pb2_grpc.WorkerServiceServicer):
             pull_budget_ms=self._role.pull_budget_ms,
             allow_partial_hit=self._role.allow_partial_hit,
         )
-        self._runner = ModelRunner(
-            self._pool,
-            attn_backend_name=self._role.attn_backend_name,
-            pad_num_reqs=self._role.pad_num_reqs,
-            pad_num_tokens=self._role.pad_num_tokens,
-        )
+        self._runner = ModelRunner(self._pool, role=self._role)
         self._engine = WorkerEngine(self._pool, self._runner, self._role)
         if start_engine:
             self._engine.start()

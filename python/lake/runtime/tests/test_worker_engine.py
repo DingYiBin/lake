@@ -102,7 +102,7 @@ def test_concurrent_submit_shared_scheduler() -> None:
 def test_role_config_from_env() -> None:
     keys = [
         "LAKE_WORKER_ROLE",
-        "LAKE_ENABLE_DRAFTER",
+        "LAKE_NUM_DRAFT_TOKENS",
         "LAKE_MAX_RUNNING_REQS",
         "LAKE_ENABLE_OVERLAP",
         "LAKE_MODEL_PATH",
@@ -114,7 +114,7 @@ def test_role_config_from_env() -> None:
     saved = {k: os.environ.get(k) for k in keys}
     try:
         os.environ["LAKE_WORKER_ROLE"] = "prefill"
-        os.environ["LAKE_ENABLE_DRAFTER"] = "1"
+        os.environ["LAKE_NUM_DRAFT_TOKENS"] = "4"
         os.environ["LAKE_MAX_RUNNING_REQS"] = "3"
         os.environ["LAKE_ENABLE_OVERLAP"] = "0"
         os.environ["LAKE_MODEL_PATH"] = QWEN3_0_6B_MODEL_ID
@@ -127,7 +127,8 @@ def test_role_config_from_env() -> None:
         assert cfg.model_path == QWEN3_0_6B_MODEL_ID
         assert cfg.served_model_name == "public-qwen"
         assert cfg.model_revision == "r1"
-        assert cfg.enable_drafter is True
+        assert cfg.num_draft_tokens == 4
+        assert cfg.drafter_enabled is True
         assert cfg.max_running_reqs == 3
         assert cfg.enable_overlap is False
         assert cfg.warmup_num_reqs == 2
