@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from lake.runtime.exec_mode import ExecMode
 from lake.runtime.prefix_hint import PrefixHint
-from lake.runtime.role import WorkerRole
+from lake.engine.config import WorkerRole
 
 
 def select_exec_mode(

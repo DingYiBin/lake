@@ -22,7 +22,7 @@ from lake.runtime.future_map import FutureMap
 from lake.runtime.mode_select import full_local_hit, select_exec_mode
 from lake.runtime.prefix_hint import PrefixHint
 from lake.runtime.req import Req
-from lake.runtime.role import RoleConfig
+from lake.engine.config import RoleConfig
 from lake.runtime.scheduler_output import (
     CachedRequestData,
     ForwardMode,

@@ -22,7 +22,7 @@ from lake.pb import lake_pb2, lake_pb2_grpc
 from lake.runtime.exec_mode import ExecMode
 from lake.runtime.mode_select import select_exec_mode
 from lake.runtime.node_scheduler import build_req_from_generate
-from lake.runtime.role import RoleConfig
+from lake.engine.config import RoleConfig
 from lake.runtime.worker_engine import WorkerEngine
 
 LOG = logging.getLogger("lake.worker")

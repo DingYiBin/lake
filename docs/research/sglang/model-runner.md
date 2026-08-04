@@ -547,8 +547,9 @@ execute_model(dummy_scheduler_output, dummy_run=True,
 
 ## Data Parallel:拓扑、选路与空闲同步
 
-> 场景:32 卡一次启动、`dp=32`。两边都是 **每 DP rank 独立 Scheduler/EngineCore**,**不**共享一个全局调度器。共享的是前端入口与(可选)协调/路由进程。  
-> vLLM 官方概述:`3rdparty/vllm/docs/serving/data_parallel_deployment.md`。
+> 场景:32 卡一次启动、`dp=32`。两边都是 **每 DP rank 独立 Scheduler/EngineCore**,**不**共享一个全局调度器。共享的是前端入口与(可选)协调/路由进程。
+> vLLM 官方概述:`3rdparty/vllm/docs/serving/data_parallel_deployment.md`。  
+> **通信模块 + layer 切分 / 副本 DP vs dp-attn**见 [`../parallelism-tp-dp.md`](../parallelism-tp-dp.md)。
 
 ### 一句话对照
 
@@ -778,7 +779,8 @@ SGLang **战略上也在做「全局 Router 调度」**,问题域与 lake §1.1 
 
 ## Tensor / Pipeline Parallel:控制面
 
-> 焦点:**谁驱动一步、工作如何扇出到各 GPU**,不是切分数学。与上节 DP 对照——DP 是多副本独立调度;TP/PP 是**同一副本内**多卡锁步。
+> 焦点:**谁驱动一步、工作如何扇出到各 GPU**,不是切分数学。与上节 DP 对照——DP 是多副本独立调度;TP/PP 是**同一副本内**多卡锁步。  
+> 切分数学与 `communication_op`/parallel linear 清单见 [`../parallelism-tp-dp.md`](../parallelism-tp-dp.md)。
 
 ### 一句话对照
 

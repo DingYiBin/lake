@@ -176,7 +176,8 @@ vLLM V1 引擎内现有 **两套** GPU ModelRunner,由 `VLLM_USE_V2_MODEL_RUNNER
 
 ## Data Parallel(EngineCore / Coordinator / LB)
 
-> 官方:`docs/serving/data_parallel_deployment.md`。与 SGLang 对照见 [`../sglang/model-runner.md`](../sglang/model-runner.md)「Data Parallel」。
+> 官方:`docs/serving/data_parallel_deployment.md`。与 SGLang 对照见 [`../sglang/model-runner.md`](../sglang/model-runner.md)「Data Parallel」。  
+> **通信模块 / 通信域构造 / 指定 DP 选路（`X-data-parallel-rank`）**见 [`../parallelism-tp-dp.md`](../parallelism-tp-dp.md) §1.4、§3.4。
 
 **拓扑**:`--data-parallel-size=N` 时,**每 DP rank 一个独立 `EngineCore` 进程**,各自内嵌 `Scheduler` + Executor/Worker——**不**共享全局 Scheduler。API server(可 `--api-server-count`)选路;DP>1 另有 `DPCoordinator` 汇聚队列统计、管理 request wave、广播 `START_DP_WAVE`。TP>1 时每 EngineCore 再挂 TP 个 GPU worker。
 
@@ -193,7 +194,8 @@ vLLM V1 引擎内现有 **两套** GPU ModelRunner,由 `VLLM_USE_V2_MODEL_RUNNER
 
 ## Tensor / Pipeline Parallel(Executor 扇出)
 
-> 与 SGLang 对照见 [`../sglang/model-runner.md`](../sglang/model-runner.md)「Tensor / Pipeline Parallel」。官方:`docs/serving/parallelism_scaling.md`。
+> 与 SGLang 对照见 [`../sglang/model-runner.md`](../sglang/model-runner.md)「Tensor / Pipeline Parallel」。官方:`docs/serving/parallelism_scaling.md`。  
+> **NCCL/`communication_op`/Column·Row 层**见 [`../parallelism-tp-dp.md`](../parallelism-tp-dp.md)。
 
 **拓扑(单 DP rank)**:1 个 `EngineCore` = **1 个 Scheduler** + `Executor` + **`TP×PP` 个 Worker**(每 GPU 一个)。与 SGLang「每 GPU 一个完整 Scheduler」不同。
 

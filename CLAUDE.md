@@ -107,6 +107,7 @@ docs/
    - **Sampling 参数对照**(SGLang × vLLM;`n`≠beam;spec 兼容;penalty 空泡;状态归属与前缀共享) → `docs/research/sampling-params.md`
    - **Scheduler→Worker 字段**(vLLM `SchedulerOutput` × SGLang `ScheduleBatch`/`ForwardBatch`、架构根因) → `docs/research/scheduler-worker-interface.md`
    - **Attention 后端对照**(vLLM × SGLang:基类/分派/metadata 形态、各平台 kernel 来源、CPU 纯 torch 路径、model runner 子类化 vs 单类、MIXED 与并行度) → `docs/research/attention-backends.md`
+   - **TP / DP 并行**(通信模块 GroupCoordinator/`communication_op`/Custom AR·PyNCCL、Column/Row/QKV/Vocab 层、副本 DP vs dp-attn、IDLE/dummy) → `docs/research/parallelism-tp-dp.md`
    - 跨实例复用 + 多存储后端 + 内容寻址 + 控制器元数据 + Rust 裸设备 I/O → `docs/research/lmcache/{overview,sharing-and-backends}.md`
    - RDMA 零拷贝传输 + 多 NIC 聚合 + 对象级 KV store + 分配策略 + HA → `docs/research/mooncake/{overview,transfer-engine,kv-store}.md`
    - **昇腾 KV 对象池**(MemCache):Meta/Local、HBM/DRAM/SSD、MemFabric OneCopy → `docs/research/memcache/{overview,architecture,pain-points}.md`（与 Mooncake store 同层对照；非 radix 控制面）
@@ -117,6 +118,7 @@ docs/
    - **编排层/控制面**:KV-aware router(overlap 量化) + KVBM logical/physical/engine 三层 offload + Placement/StorageTier(介质非位置) + 链式 block 哈希 + 多后端通信(etcd/nats/tcp/zmq) → `docs/research/dynamo/overview.md`
    - **超低延迟 decode / vLLM PD 插件**(TileRT):connector claim、MTP-aware 传 KV、NIXL/Mooncake → `docs/research/tilert/{overview,pd-vllm,pain-points}.md`（核闭源,不作存储面参考）
    - **Attention 后端对照**(SGLang × vLLM):基类/分派/metadata、各平台 kernel 来源、model runner、MIXED 与并行度 → `docs/research/attention-backends.md`
+   - **TP / DP 并行**(通信栈 + parallel linear/embedding + 副本 DP/dp-attn) → `docs/research/parallelism-tp-dp.md`
    - **CPU attention 参照**(llama.cpp):ggml `GGML_OP_FLASH_ATTN_EXT`(split-KV decode + tiled prefill + SIMD 分派),CPU 上有无 FA2 等价物 → `docs/research/llama.cpp/overview.md`（仅 CPU 算子参考,非存储/调度参考）
    - 跨项目逐层对应与借鉴顺序 → `docs/research/3rdparty-reference.md`
 3. **沿代码回溯**：每个参考文档末尾都有「代码索引」节，把概念/机制映射到 `文件:符号`。符号名是稳定锚点（行号会漂移，找不到时 `grep -n "符号名" 3rdparty/<repo>/<文件路径>`）。需要确认实现细节时，直接读对应符号的源码。

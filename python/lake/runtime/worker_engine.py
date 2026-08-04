@@ -12,6 +12,10 @@ import time
 from dataclasses import dataclass
 from typing import Dict, Optional
 
+from lake.engine.distributed import (
+    destroy_model_parallel,
+    ensure_model_parallel_initialized,
+)
 from lake.engine.model_runner import ModelRunner
 from lake.engine.pool_iface import PoolIface
 from lake.runtime.executor import RuntimeExecutor, SingleProcessExecutor
@@ -19,7 +23,7 @@ from lake.runtime.lifecycle import CapacitySignal, WorkerLifecycle, WorkerState
 from lake.runtime.node_scheduler import NodeScheduler
 from lake.runtime.prefix_hint import PrefixHint
 from lake.runtime.req import Req
-from lake.runtime.role import RoleConfig
+from lake.engine.config import RoleConfig
 
 LOG = logging.getLogger("lake.worker_engine")
 
@@ -106,20 +110,26 @@ class WorkerEngine:
             if self._started or self._thread.is_alive():
                 return
             # C12：Boot→Warm(load/warmup)→Ready→Serving。
+            # 对齐 vLLM init_worker_distributed_environment：load 前建通讯域。
             self._life.advance(WorkerState.BOOT)
-            self._life.warm()
-            self._runner.load_model(
-                model_path=self._role.model_path,
-                served_model_name=self._role.served_model_name,
-                revision=self._role.model_revision,
-            )
-            self._runner.warmup(
-                num_reqs=self._role.warmup_num_reqs,
-                tokens_per_req=self._role.warmup_tokens_per_req,
-            )
-            self._life.ready()
-            self._life.serve()
-            self._started = True
+            try:
+                ensure_model_parallel_initialized(self._role.parallel)
+                self._life.warm()
+                self._runner.load_model(
+                    model_path=self._role.model_path,
+                    served_model_name=self._role.served_model_name,
+                    revision=self._role.model_revision,
+                )
+                self._runner.warmup(
+                    num_reqs=self._role.warmup_num_reqs,
+                    tokens_per_req=self._role.warmup_tokens_per_req,
+                )
+                self._life.ready()
+                self._life.serve()
+                self._started = True
+            except Exception:
+                destroy_model_parallel()
+                raise
         self._thread.start()
 
     def stop(self, timeout: float = 5.0) -> None:
@@ -133,6 +143,7 @@ class WorkerEngine:
             if not self._started:
                 # 从未 start：无 loop 可 join，直接终态
                 self._life.advance(WorkerState.TERMINATE)
+                destroy_model_parallel()
                 return
             first = not self._stop.is_set()
             if first:
@@ -149,6 +160,7 @@ class WorkerEngine:
             )
             return
         self._life.advance(WorkerState.TERMINATE)
+        destroy_model_parallel()
 
     def submit(self, req: Req, hint: Optional[PrefixHint] = None) -> Req:
         """阻塞直到该请求 finished（或引擎故障）。返回完成后的 Host Req。"""

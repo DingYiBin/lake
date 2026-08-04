@@ -280,9 +280,19 @@ HBM 也归存储池后(见 [`overview.md`](overview.md) / [`kv-cache-pool.md`](k
 - **SGLang**:`memory_pool.py::MHATokenToKVPool`(L1 固定 arena + post-capture VA 原地 back,我们不取物理超订语义)+ `radix_cache.py::TreeNode`(节点记三层位置)+ `hiradix_cache.py::match_prefix`(L1前缀/L2后缀切分)+ `pool_host/mha.py::get_page_buffer_meta`(page-first 零拷贝裸指针)+ `cache_controller.py::LayerDoneCounter`/`LayerLoadingEvent`(三缓冲,我们不照搬)+ `transfer.cu::transfer_kv_per_layer_pf_lf`(layer-first↔page-first 转换核,池侧照用)。见 [`../research/sglang/{overview,hicache}.md`](../research/sglang/)。
 - **关键差异**:vLLM/SGLang 引擎既拥有 KV 又发起传输(engine-to-engine connector 握手,知道地址);我们 engine-to-engine 控制链切断,池 agent 发起,引擎降到 publish/pull+fence、不知地址、不组装 block table。wire 效率不变(直连 RDMA),变的是控制权归属——"彻底存算分离"在传输/入图面的落点。
 
-### TP
+### TP / DP 通讯域（ParallelConfig）
 
-proto 预留 per-rank 字段,实现单卡先行。MLA 多 rank 回写去重(SGLang 设计 doc 提及)留作后续参考。
+对齐 vLLM mesh：`DP × PP × TP`（PCP=1）。配置与建组骨架已落在计算层：
+
+| 模块 | 路径 | 说明 |
+|------|------|------|
+| `ParallelConfig` / `RoleConfig` | `python/lake/engine/config/{parallel,role}.py` | 计算层配置权威路径（对齐 vLLM `vllm/config/`）；env：`LAKE_TP_SIZE` / `LAKE_DP_SIZE` / … |
+| `parallel_state` | `python/lake/engine/distributed/parallel_state.py` | `GroupCoordinator` + `initialize_model_parallel`；切出 TP/PP/DP 组 |
+| 挂点 | `RoleConfig.parallel`；`WorkerEngine.start` → `ensure_model_parallel_initialized`（load 前） | 对齐 vLLM `init_worker_distributed_environment` |
+
+**当前约束**：默认 `tp=dp=pp=1`，不碰 `torch.distributed`。`world_size_across_dp > 1` 时先 `init_distributed_environment` 再建子组；collective 后端（NCCL / custom AR）与 parallel linear 尚未挂接。选路仍归 Go Router，worker 不内置 DP LB。对照见 [`../research/parallelism-tp-dp.md`](../research/parallelism-tp-dp.md)。
+
+proto 预留 per-rank 字段；MLA 多 rank 回写去重(SGLang 设计 doc 提及)留作后续参考。
 
 ## 投机解码
 
@@ -644,7 +654,7 @@ Python 落点：`runtime/scheduler_output.py`（dataclass）← `node_scheduler`
 | 里程碑 | 内容 | 主改 | 验收 |
 |--------|------|------|------|
 | **C11** | **Runner 静态 buffer + lake AttentionMetadata v2**：引入固定地址 `InputBuffers` / block table / slot mapping 镜像；`SchedulerOutput` 携带 scheduler 权威 query geometry，runner 只读并导出 device-ready 形态 | `lake/engine/input_batch.py`、`lake/engine/model_executor/layers/attentions/attention_metadata.py`、`lake/engine/model_runner.py`、`lake/engine/pool_types.py` | 单测覆盖 ragged query_start、decode 单 token、overlap inflight geometry、chunked extend、agent block table 缺失/错配 |
-| **C12** | **真实模型加载骨架**：`load_model` / `warmup` / 权重 pin 回调；加载时用 `transformers.AutoConfig.from_pretrained(model_path)` 读取 HF config，再由 `lake.engine.model_executor.models.registry` 按 `config.architectures` lazy 注册模型类；模型创建与权重加载按 vLLM-style `BaseModelLoader` / `DummyModelLoader` / `DefaultModelLoader` 分层；Qwen3 模型类补齐 packed `qkv_proj` / `gate_up_proj` module tree，attention 增加纯 Torch SDPA backend | `lake/engine/model_runner.py`、`lake/engine/model_executor/models/`、`lake/runtime/lifecycle.py`、`lake/runtime/role.py` | Worker Warm→Ready 时完成模型 init；加载失败由 HF config/loader 抛错；对外名称默认 `served_model_name="model"`，不从路径派生；runner 不硬编码具体模型判断；dummy/warmup 不触 KV done；容量信号带模型状态 |
+| **C12** | **真实模型加载骨架**：`load_model` / `warmup` / 权重 pin 回调；加载时用 `transformers.AutoConfig.from_pretrained(model_path)` 读取 HF config，再由 `lake.engine.model_executor.models.registry` 按 `config.architectures` lazy 注册模型类；模型创建与权重加载按 vLLM-style `BaseModelLoader` / `DummyModelLoader` / `DefaultModelLoader` 分层；Qwen3 模型类补齐 packed `qkv_proj` / `gate_up_proj` module tree，attention 增加纯 Torch SDPA backend | `lake/engine/model_runner.py`、`lake/engine/model_executor/models/`、`lake/runtime/lifecycle.py`、`lake/engine/config/role.py` | Worker Warm→Ready 时完成模型 init；加载失败由 HF config/loader 抛错；对外名称默认 `served_model_name="model"`，不从路径派生；runner 不硬编码具体模型判断；dummy/warmup 不触 KV done；容量信号带模型状态 |
 | **C13** | **Sampling / structured output 挂载点（D7）**：拆 `execute_model` 与 `sample_tokens` 的时序；加入 `GrammarOutput` / bitmask 占位，明确 spec+grammar 何时关 overlap | `lake/engine/sample/`、`lake/runtime/scheduler_output.py`、`lake/runtime/node_scheduler.py` | 贪心采样不回归；structured 占位可 defer sample；spec+grammar 强制 drain 的测试存在 |
 | **C14** | **pool_iface 生产会计契约**：把 `commit_write_extent`、partial hit、prepare/done 错误路径从 mock 语义提升为 agent FFI 契约；补 D10 device accounting 文档与测试 | `lake/engine/pool_iface.py`、`lake/engine/agent.py`、`lake/engine/agents/memory.py`、`lake/engine/tests/` | 旧 commit 不压新 prepare HWM；`TIMEOUT`/`CAPACITY` 不触发 mode fallback；finish 只打一次 agent |
 | **C15** | **D8 runtime executor 草案**：单进程 executor 先抽象 `execute_model(SchedulerOutput)` 扇出接口，TP/PP 真通信后置 | `lake/runtime/worker_engine.py`、`lake/runtime/` 新 executor 模块、测试 | 单卡路径仍走同接口；未来多 worker 可接同一 output；不复制 Host `Req` 权威 |
@@ -750,7 +760,7 @@ process_batch_result → finished? → on_request_finished
 |---|------|------|----------|
 | D1 | **`SchedulerOutput` / `NodeScheduleOutput` 字段草图** | **已定**（见上节「D1」） | 本节；代码 `runtime/scheduler_output.py` |
 | D2 | **`pool_iface` FFI 契约** | **已定**（见上节「D2」）；代码 `lake/engine/agent.py` + `lake/engine/pool_types.py` | 本节；FFI 不进 proto |
-| D3 | **角色配置 schema** | `role=prefill\|decode\|hybrid` 已定方向;未定完整启动配置(模型、TP、是否挂 drafter、arena 尺寸、上报指标标签)；C0 仅最小 `RoleConfig` | `runtime` 配置节;与冷启动 Warm 对齐 |
+| D3 | **角色配置 schema** | `role=prefill\|decode\|hybrid` 已定方向;未定完整启动配置(模型、TP、是否挂 drafter、arena 尺寸、上报指标标签)；C0 仅最小 `RoleConfig`（权威路径 `engine/config/role.py`） | `engine/config`；与冷启动 Warm 对齐 |
 | D4 | **Attention 后端与 metadata 边界** | **C8 初版已定**：`attn/metadata.py::AttentionMetadata` + `ReadyHandle.block_table_by_req`（agent 出表、runner 只读）；`forward_queries` 残差路径；真固定地址 tensor / paged kernel 仍待生产。**2026-08-02 补**（见 [`../research/attention-backends.md`](../research/attention-backends.md)）：① metadata 保持 vLLM 形态（独立 `AttentionMetadata` + `build_attn_metadata`），不学 SGLang 并进 ForwardBatch；② GPU 生产走 FA2 paged varlen（`FlashAttn2Backend`，上游 `flash-attn` 包，`causal=True` 统一三模式、GQA 原生、非入图），CPU/dev/test 走纯 torch SDPA 方案 A（`CpuAttentionBackend.forward_varlen`，原 `TorchAttentionBackend` 改名，per-request 循环 + gather paged + SDPA，对齐 SGLang `torch_native`）；③ **不装 vllm**——单体 serving 系统非 library，与 Q1/Q2 冲突；GPU 借 flash-attn 优先上游包（FA2 varlen 已带 `block_table`），若上游不支持小 `block_size`（`with_kvcache` 要求 256 倍数）或入图需 `out=`，再回退 `vllm-project/flash-attention` fork；④ `ModelRunner` 保持单类 + architecture registry + attn 注册表，**不**按平台子类化（vLLM 子类化是历史包袱，V2 已向单类收敛）；**后端注入**：runner 经 `build_attn_backend(attn_backend_name)` 建实例（`RoleConfig.attn_backend_name`/`LAKE_ATTN_BACKEND`，默认 `cpu`），构造期沿模型树下传到 `Qwen3PagedAttention.backend`——模型层不 import 任何具体后端（对齐 vLLM `Attention`/SGLang `RadixAttention`：后端在 runner 层选定注入，层只持句柄）；lake 取 vLLM（构造期注入）+ SGLang（runner 持单实例）折中，免 forward context 改造；⑤ `ForwardMode.MIXED` 不单独 `forward_mixed`——调度侧把 decode 标成 `extend_len=1`，runner 侧 varlen 自然吃（SGLang CUDA 同款，仅 NPU 因 kernel 限制另写 `forward_mixed`）；⑥ **混部共享进程级并行度，prefill/decode 差异化并行必须走 PD 分离**（Router 选路），不能在混部里做——并行度是进程级配置，MIXED 同 forward 同 communicator | 对照 vLLM `AttentionMetadataBuilder`；详见 [`../research/attention-backends.md`](../research/attention-backends.md) |
 | D5 | **节点级 scheduler 与 agent 的交互序** | **已定**（见上节「D5」）：schedule→prepare(预算)→ready→execute→done；默认 all-or-nothing；overlap 延迟 free | 本节 + [`scheduling.md`](scheduling.md) §3 |
 
