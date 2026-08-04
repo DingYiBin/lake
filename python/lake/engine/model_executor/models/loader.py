@@ -9,6 +9,9 @@ import inspect
 from collections.abc import Iterable
 from typing import Generic, Literal, TypeVar
 
+import torch
+import torch.nn as nn
+
 
 TModel = TypeVar("TModel")
 TConfig = TypeVar("TConfig")
@@ -88,3 +91,44 @@ def get_model_loader(
     if load_format == "hf":
         return DefaultModelLoader(model_path=model_path, revision=revision)
     raise ValueError(f"unsupported load_format={load_format!r}")
+
+
+def materialize_model(
+    model: TModel,
+    *,
+    device: str | torch.device = "cpu",
+    dtype: torch.dtype | None = None,
+    seed: int = 0,
+) -> TModel:
+    """把 ``meta`` device 上的模型物化到真实 device 并做小随机 init。
+
+    C16a：dummy 路径需要真实权重才能跑 forward。模型构造在 ``device="meta"``
+    （避免骨架阶段分配 0.6B 权重）；本函数做 ``to_empty`` 后按角色 init：
+    RMSNorm 权重置 1（保 identity-ish）、embedding/linear 小 normal、bias 置 0，
+    使 forward 产有限非退化 logits。仅对 ``nn.Module`` 生效；非 Module（自定义/
+    测试桩）原样返回。对齐 vLLM ``to_empty`` + ``materialize`` 的 dummy 物化语义。
+    """
+    if not isinstance(model, nn.Module):
+        return model
+    has_meta = any(p.device.type == "meta" for p in model.parameters())
+    has_meta = has_meta or any(
+        getattr(b, "device", torch.device("cpu")).type == "meta"
+        for b in model.buffers()
+    )
+    if has_meta:
+        model.to_empty(device=device)
+    if dtype is not None:
+        model.to(dtype)
+    gen = torch.Generator().manual_seed(seed)
+    for module in model.modules():
+        if isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, std=0.02, generator=gen)
+        elif hasattr(module, "variance_epsilon") and hasattr(module, "weight"):
+            # RMSNorm-like：权重置 1，forward 近似 identity
+            nn.init.ones_(module.weight)
+        elif hasattr(module, "weight") and isinstance(getattr(module, "weight", None), nn.Parameter):
+            nn.init.normal_(module.weight, std=0.02, generator=gen)
+            bias = getattr(module, "bias", None)
+            if bias is not None:
+                nn.init.zeros_(bias)
+    return model

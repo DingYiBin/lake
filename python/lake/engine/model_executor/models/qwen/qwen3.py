@@ -54,28 +54,76 @@ def _tp_world_size() -> int:
 
 
 class Qwen3RMSNorm(nn.Module):
-    """RMSNorm parameter shell matching Qwen3/vLLM naming."""
+    """RMSNorm parameter shell matching Qwen3/vLLM naming.
+
+    C16a：落实真实 RMSNorm（对齐 Transformers ``Qwen3RMSNorm.forward``——fp32 方差 +
+    rsqrt，再乘权重）。``residual`` 可选：先加残差再归一化（对齐 vLLM RMSNorm 的
+    残差融合入口），无残差时直接归一化。
+    """
 
     def __init__(self, hidden_size: int, eps: float = 1e-6, dtype: torch.dtype = torch.bfloat16) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.empty(hidden_size, device="meta", dtype=dtype))
         self.variance_epsilon = eps
 
-    def forward(self, hidden_states: object, residual: object | None = None) -> object:
-        return hidden_states if residual is None else (hidden_states, residual)
+    def forward(self, hidden_states: torch.Tensor, residual: torch.Tensor | None = None) -> torch.Tensor:
+        if residual is not None:
+            hidden_states = hidden_states + residual
+        input_dtype = hidden_states.dtype
+        h = hidden_states.to(torch.float32)
+        variance = h.pow(2).mean(-1, keepdim=True)
+        h = h * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * h.to(input_dtype)
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
 
 
 class Qwen3RotaryEmbedding(nn.Module):
-    """RoPE metadata placeholder; real kernel wiring belongs to a later phase."""
+    """RoPE；C16a 落实真实旋转位置编码。
+
+    对齐 Transformers ``Qwen3RotaryEmbedding`` + ``apply_rotary_pos_emb``：现场由
+    ``rope_theta`` + ``head_dim`` 算 ``inv_freq``（不依赖 ``meta`` buffer，避免
+    物化时 buffer 残留 meta），对 ``positions [T]`` 产 cos/sin，``rotate_half``
+    应用到 q/k。lake KV 归池、模型 API 不持 KV 生命周期，故此处只旋转 q/k 张量。
+    """
 
     def __init__(self, config: Qwen3Config) -> None:
         super().__init__()
         self.head_dim = _head_dim(config)
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_parameters = getattr(config, "rope_parameters", None)
+        rope_theta = 10000.0
+        if self.rope_parameters is not None:
+            rope_theta = float(self.rope_parameters.get("rope_theta", 10000.0))
+        self.rope_theta = rope_theta
 
-    def forward(self, positions: object, q: object, k: object) -> tuple[object, object]:
-        return q, k
+    def forward(
+        self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # inv_freq [head_dim/2]
+        half = self.head_dim // 2
+        inv_freq = 1.0 / (
+            self.rope_theta
+            ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=q.device) / self.head_dim)
+        )
+        # freqs [T, head_dim/2] -> emb [T, head_dim]
+        freqs = positions.to(torch.float32)[:, None] * inv_freq[None, :]
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = emb.cos()
+        sin = emb.sin()
+        # q/k [..., head_dim]；cos/sin [T, head_dim] -> 广播到 head 维
+        # 期望 q/k 形如 [T, H, head_dim]
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+        cos = cos.to(q.dtype)
+        sin = sin.to(q.dtype)
+        q_embed = (q * cos) + (_rotate_half(q) * sin)
+        k_embed = (k * cos) + (_rotate_half(k) * sin)
+        return q_embed, k_embed
 
 
 class Qwen3PagedAttention(nn.Module):
@@ -210,8 +258,33 @@ class Qwen3Attention(nn.Module):
         self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
         self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps, dtype=dtype)
 
-    def forward(self, positions: object, hidden_states: object) -> object:
-        return hidden_states
+    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        """C16a：真实 attention forward（非分页 dummy 路径）。
+
+        ``hidden_states [T, hidden]`` → ``qkv_proj`` → 拆 q/k/v → ``q_norm``/``k_norm``
+        → RoPE → ``Qwen3PagedAttention``（``attn_meta=None`` 走 ``forward_tensors``，
+        对全序列 causal）→ ``o_proj`` → ``[T, hidden]``。paged 路径（``attn_meta`` 非空、
+        KV arena）见 C16b。
+        """
+        T = hidden_states.shape[0]
+        qkv = self.qkv_proj(hidden_states)  # [T, q_size + 2*kv_size]（TP=1 全宽）
+        q_size = self.num_heads * self.head_dim
+        kv_size = self.num_kv_heads * self.head_dim
+        q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+        q = q.view(T, self.num_heads, self.head_dim)
+        k = k.view(T, self.num_kv_heads, self.head_dim)
+        v = v.view(T, self.num_kv_heads, self.head_dim)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        q, k = self.rotary_emb(positions, q, k)
+        # forward_tensors 要 [B, H, T, D]：B=1
+        q_bt = q.unsqueeze(0).permute(0, 2, 1, 3)  # [1, H, T, D]
+        k_bt = k.unsqueeze(0).permute(0, 2, 1, 3)
+        v_bt = v.unsqueeze(0).permute(0, 2, 1, 3)
+        attn_out = self.attn(q_bt, k_bt, v_bt)  # [1, H, T, D]
+        # [1, H, T, D] -> [T, H*D]
+        attn_out = attn_out.squeeze(0).movedim(0, 1).reshape(T, self.num_heads * self.head_dim)
+        return self.o_proj(attn_out)
 
 
 class Qwen3MLP(nn.Module):
@@ -240,8 +313,12 @@ class Qwen3MLP(nn.Module):
         )
         self.act_fn = nn.SiLU()
 
-    def forward(self, hidden_states: object) -> object:
-        return hidden_states
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """C16a：真实 MLP（对齐 vLLM ``Qwen2MLP``：``down(act(gate)*up)``）。"""
+        gate_up = self.gate_up_proj(hidden_states)  # [T, 2*intermediate]
+        inter = gate_up.shape[-1] // 2
+        gate, up = gate_up.split([inter, inter], dim=-1)
+        return self.down_proj(self.act_fn(gate) * up)
 
 
 class Qwen3Model(nn.Module):
@@ -274,15 +351,16 @@ class Qwen3Model(nn.Module):
 
     def forward(
         self,
-        input_ids: object | None = None,
-        positions: object | None = None,
+        input_ids: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
         intermediate_tensors: object | None = None,
-        inputs_embeds: object | None = None,
-    ) -> object:
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """C16a：真实 backbone forward（embed → layers → norm）。返回 hidden [T, hidden]。"""
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
-            hidden_states = input_ids
+            hidden_states = self.embed_tokens(input_ids)
         for layer in self.layers:
             hidden_states = layer(hidden_states, positions)
         return self.norm(hidden_states)
@@ -306,8 +384,21 @@ class Qwen3DecoderLayer(nn.Module):
             dtype=dtype,
         )
 
-    def forward(self, hidden_states: object, positions: object | None = None) -> object:
-        return hidden_states
+    def forward(self, hidden_states: torch.Tensor, positions: torch.Tensor | None = None) -> torch.Tensor:
+        """C16a：真实 decoder layer（双残差 + 双 RMSNorm + attn + mlp）。
+
+        对齐 Transformers ``Qwen3DecoderLayer``：``h = h + attn(norm1(h))``；
+        ``h = h + mlp(norm2(h))``。RMSNorm 不融合残差（残差在层内显式加），与
+        vLLM RMSNorm 的残差融合入口区别——lake CPU 路径先求简。
+        """
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(positions, hidden_states)
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        return residual + hidden_states
 
 
 class Qwen3ForCausalLM(nn.Module):
@@ -341,15 +432,25 @@ class Qwen3ForCausalLM(nn.Module):
 
     def forward(
         self,
-        input_ids: object | None = None,
-        positions: object | None = None,
+        input_ids: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
         intermediate_tensors: object | None = None,
-        inputs_embeds: object | None = None,
-    ) -> object:
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """C16a：返回 backbone hidden [T, hidden]（不在此处算 logits，由
+        ``compute_logits`` 单独取，便于 runner 只算末位 token）。"""
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
-    def compute_logits(self, hidden_states: object) -> object:
-        return hidden_states
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """C16a：``hidden [T, hidden]`` → ``lm_head`` → ``[T, vocab]``。
+
+        tie 时 ``lm_head is embed_tokens``：用 ``F.linear(hidden, embed.weight)``；
+        否则 ``lm_head`` 为 ``ColumnParallelLinear``（``gather_output=False``，TP=1
+        即全宽 vocab）。
+        """
+        if self.lm_head is self.model.embed_tokens:
+            return torch.nn.functional.linear(hidden_states, self.model.embed_tokens.weight)
+        return self.lm_head(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, object]]) -> set[str]:
         self.loaded_weights = {name for name, _ in weights}

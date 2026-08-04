@@ -64,7 +64,13 @@ def test_dummy_run_skips_pool_done() -> None:
     assert runner._input_batch.req_ids == ["dummy-0", "dummy-1"]  # noqa: SLF001
     assert runner._attn_meta is not None  # noqa: SLF001
     assert runner._attn_meta.num_actual_tokens == 2  # noqa: SLF001
-    assert out.next_token_ids == {"dummy-0": [6], "dummy-1": [6]}
+    # C16a：dummy_run 经真实 forward 产 token（不再用 host 哈希 dummy logits）。
+    # 两请求上下文相同 → 同 token；落在 vocab 内。
+    toks = list(out.next_token_ids.values())
+    assert len(toks) == 2
+    assert all(len(t) == 1 for t in toks)
+    assert all(0 <= t[0] < 256 for t in toks)
+    assert toks[0] == toks[1]
 
 
 def test_extend_process_consumes_prepare_commit_guard() -> None:

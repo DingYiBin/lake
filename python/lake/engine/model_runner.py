@@ -10,12 +10,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
+import torch
+
 from lake.engine.model_executor.layers.attentions import (
     AttentionMetadata,
     build_attn_backend,
     build_attn_metadata,
 )
 from lake.engine.input_batch import InputBatch, InputBuffers
+from lake.engine.model_executor.models.loader import materialize_model
 from lake.engine.model_executor.models.registry import load_registered_model
 from lake.engine.pool_iface import PoolIface
 from lake.engine.pool_types import ReadyHandle
@@ -142,6 +145,10 @@ class ModelRunner:
             attn_backend=self._attn_backend,
         )
         self._model = loaded.model
+        # C16a：dummy 路径物化 meta 权重到 cpu（小随机 init），使 forward 产真实 logits。
+        # 真权重（load_format="hf"）由 DefaultModelLoader 装载，不物化。
+        if loaded.load_format == "dummy":
+            materialize_model(self._model, device="cpu")
         self._architecture = loaded.architecture
         self._model_path = loaded.model_path
         self._served_model_name = served_model_name or "model"
@@ -335,6 +342,12 @@ class ModelRunner:
         host_reqs: Mapping[str, Req],
         batch: InputBatch,
     ) -> Tuple[Dict[str, List[int]], Dict[str, List[int]]]:
+        """C16a：逐请求真实 forward（非分页 dummy 路径）。
+
+        对每个非 prompt-phase 请求，把全上下文 ``input_ids`` 喂模型（B=1、对全序列
+        causal attention），取末位 token logits 采样。正确但 O(T²)——仅 dummy/test；
+        生产 paged 路径（KV arena、batched forward_varlen）见 C16b。
+        """
         assert self._model is not None
         last_logits: Dict[str, List[float]] = {}
         for row, req_id in enumerate(batch.req_ids):
@@ -343,21 +356,16 @@ class ModelRunner:
             req = host_reqs.get(req_id)
             if req is None:
                 continue
-            last_logits[req_id] = self._dummy_model_logits(req.all_token_ids)
+            ctx = list(req.all_token_ids)
+            if not ctx:
+                continue
+            input_ids = torch.tensor(ctx, dtype=torch.long)
+            positions = torch.arange(len(ctx), dtype=torch.long)
+            with torch.no_grad():
+                hidden = self._model.forward(input_ids, positions)
+                logits = self._model.compute_logits(hidden)  # [T, vocab]
+            last_logits[req_id] = logits[-1].to(torch.float32).tolist()
         return self.sample_tokens(output, host_reqs, last_logits)
-
-    def _dummy_model_logits(self, context: List[int]) -> List[float]:
-        assert self._model is not None
-        cfg = self._model.config
-        logits = [0.0] * cfg.vocab_size
-        logits[self._dummy_model_token(context)] = 1.0
-        return logits
-
-    def _dummy_model_token(self, context: List[int]) -> int:
-        assert self._model is not None
-        cfg = self._model.config
-        seed = context[-1] if context else cfg.bos_token_id
-        return (int(seed) + len(context) + cfg.num_hidden_layers) % cfg.vocab_size
 
     def clear_drafter(self, req_id: str) -> None:
         return None

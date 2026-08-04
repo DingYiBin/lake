@@ -675,6 +675,8 @@ Python 落点：`runtime/scheduler_output.py`（dataclass）← `node_scheduler`
 
 **C15 状态（2026-08-03）**：已落 `lake/runtime/executor.py`，定义 `ExecutorInput` / `RuntimeExecutor` / `SingleProcessExecutor`；`NodeScheduler._run_batch()` 改为通过 executor 消费同一份 `SchedulerOutput + ReadyHandle + Host Req 映射`，并用 `finally` 保证本步 `pool.done(step_id)` 释放 ready fence。`_respect_effective_sets` / timeline / executor 均在该 `try/finally` 范围内，避免 prepare 后缩批过滤异常泄漏 ready fence。executor/model 执行异常按 vLLM fatal 语义继续上抛，不入 result queue；`WorkerEngine` 收到后 fail inflight、拒绝 inbound、退出计算 loop，等待进程管理器重拉。单测覆盖 single-process executor 调 runner、NodeScheduler 成功/异常/缩批过滤异常路径 done、WorkerEngine 注入 executor 后请求仍完成。TP/PP 真 `collective_rpc`、PP 激活传递、跨 worker 结果聚合后置；Host `Req` 权威仍留在 `NodeScheduler`，不复制进 runner/executor。
 
+**C16a 状态（2026-08-04）**：Qwen3 各子模块 forward 已由 no-op 占位落实为真实计算——`Qwen3RMSNorm`（fp32 方差+rsqrt）、`Qwen3RotaryEmbedding`（现场算 `inv_freq` + `rotate_half`，不依赖 `meta` buffer）、`Qwen3Attention`（`qkv_proj`→拆 q/k/v→`q_norm`/`k_norm`→RoPE→`Qwen3PagedAttention` 非分页 `forward_tensors`→`o_proj`）、`Qwen3MLP`（`down(act(gate)*up)`）、`Qwen3DecoderLayer`（双残差+双 RMSNorm）、`Qwen3Model`（embed→layers→norm）、`Qwen3ForCausalLM.compute_logits`（tied 用 `F.linear(hidden, embed.weight)`，untied 走 `lm_head`）。`loader.materialize_model` 把 `meta` 权重物化到 cpu（小随机 init、norm 置 1、bias 置 0），仅 `load_format="dummy"` 且 `nn.Module` 触发。`ModelRunner._forward_model` 由 host 哈希 dummy logits 切到**逐请求真实 forward**（B=1、对全上下文 causal、取末位 logits），采样/bitmask/spec-defer 契约不变。paged `forward_varlen` 经模型 forward 调起 + KV arena 暴露仍后置（C16b）。单测覆盖 tiny CPU 模型直连 forward 产有限 logits、argmax in-range 且确定性、runner dummy_run 产真实 forward token；既有 scheduler/bitmask 用例不回归。
+
 #### 本轮不做
 
 - 不接 vLLM `BlockPool` / `KVCacheManager` / runner 内 `RequestState`，这些与池权威冲突。
@@ -689,7 +691,37 @@ Python 落点：`runtime/scheduler_output.py`（dataclass）← `node_scheduler`
 - **值得参考**：vLLM 的静态 GPU buffer、attention metadata builder、生产入口复用 dummy/warmup、scheduler→worker 增量信封；SGLang 的 device 侧 token/spec relay 和关 overlap 条件。
 - **关键差异**：vLLM/SGLang 都让引擎持 KV / block table / 请求态；lake 只借接口形态和 buffer 几何，KV 位置、slot、block table 由池 agent 权威维护。vLLM `KVConnectorBase_V1` 是可选插件，lake `pool_iface` 是必经路径；vLLM 的 HBM 由 runner 分配，lake 的 HBM/L0 是存储池放置副本。Torch 在 lake 中是生产计算层硬依赖，但轻量 import / mock 路径需继续可在无 Torch 环境下做 smoke 验证。
 
-## D2 — `pool_iface` / StorageAgent FFI 草签（已定 2026-07-22）
+### C16 真实 forward（cal-0804）
+
+> 目标：把 Qwen3 模型从「module tree 占位 + no-op forward」推进到**真正产 hidden/logits 的 forward**，让 C11/P2/P3.1 建好的 buffer/metadata/padding 被一条真实计算路径消费。仍守 lake 职责边界：KV arena 归池，runner 不引入私有 block pool。
+
+#### 切片
+
+| 里程碑 | 内容 | 主改 | 验收 |
+|--------|------|------|------|
+| **C16a** | **真实 forward（非分页 dummy 路径）**：Qwen3 各子模块 forward 落实（RMSNorm / RoPE / Attention qkv→forward_tensors / MLP / decoder 残差 / model embed→layers→norm / compute_logits）；dummy 权重由 `meta` 物化到 cpu（小随机 init，norm 置 1）；`ModelRunner._forward_model` 由 host 哈希 dummy logits 切到**逐请求真实 forward**（B=1、非分页 `forward_tensors`、对全上下文 causal），取末位 logits 采样。paged `forward_varlen` + KV arena 仍后置（C16b）。 | `lake/engine/model_executor/models/qwen/qwen3.py`、`lake/engine/model_executor/models/loader.py`、`lake/engine/model_runner.py`、测试 | tiny CPU 模型直连 forward 产有限 logits；runner dummy decode 产真实 argmax token（in-range、确定性）；既有 bitmask 强制 token 用例仍过 |
+| **C16b**（后置） | **paged forward + KV arena**：池 agent 暴露 L0 arena 句柄（`ReadyHandle` 增 kv_cache），`Qwen3Attention.forward` 经 `slot_mapping` 写新 KV、`forward_varlen` 读 paged KV；`_forward_model` 切到 batched paged 路径。 | `qwen3.py`、`pool_types.py`、`agents/memory.py`、`model_runner.py` | paged 路径与逐请求非分页路径 logits 对齐；arena 归池、runner 只读 |
+
+#### 设计要点（C16a）
+
+- **非分页 dummy 路径**：`Qwen3PagedAttention.forward` 在 `attn_meta is None` 时走 `backend.forward_tensors(q,k,v,[B,H,T,D],is_causal=True)`。C16a 的 `_forward_model` 逐请求把全上下文 `input_ids` 喂模型（B=1、T=上下文长），对全序列 causal attention 后取末位 logits——**正确但 O(T²)**，仅 dummy/test 用；生产 paged 路径（C16b）才用 KV arena 增量。
+- **权重物化**：模型构造在 `device="meta"`（避免骨架阶段分配 0.6B 权重）。`DummyModelLoader` 之后由 `materialize_model(model, device="cpu")` 做 `to_empty` + 小随机 init（norm 权重置 1 保 identity-ish、embedding/linear 小 normal、bias 置 0），使 forward 产有限非退化 logits。仅 `load_format="dummy"` 且模型为 `nn.Module` 时物化；自定义/测试非 Module 类跳过。
+- **RoPE**：`Qwen3RotaryEmbedding.forward` 现场由 `rope_theta` + `head_dim` 算 `inv_freq`（不依赖 `meta` buffer），对 `positions [T]` 产 cos/sin，`rotate_half` 应用到 q/k。
+- **采样不变**：`sample_tokens` / grammar bitmask / spec defer 路径不动；C16a 只换 logits 来源（host 哈希 → 真实 forward），采样契约与既有用例兼容（bitmask 强制 token 的用例不依赖 logits 数值，只依赖 argmax 落在被允许位）。
+
+#### 本轮不做（C16a）
+
+- paged `forward_varlen` 经模型 forward 调起、KV arena 暴露、batched paged 路径（C16b）。
+- 真权重加载（`DefaultModelLoader` 仍 NotImplementedError）、真 CUDA graph capture、TP/PP 真通信。
+
+#### 参考实现与关键差异（C16a）
+
+- **参考 Transformers**：`3rdparty/transformers/src/transformers/models/qwen3/modeling_qwen3.py::Qwen3RMSNorm.forward`（fp32 方差 + rsqrt）、`Qwen3RotaryEmbedding`（`inv_freq` + `rotate_half`/`apply_rotary_pos_emb`）、`Qwen3MLP.forward`（`down(act(gate(x))*up(x))`）、`Qwen3DecoderLayer`（双残差 + 双 RMSNorm）。
+- **参考 vLLM**：`vllm/model_executor/models/qwen3.py::Qwen3ForCausalLM`（`forward`→`model`→`compute_logits`/`lm_head`）、`vllm/v1/worker/gpu/model_runner.py::GPUModelRunner._dummy_run`（dummy 复用生产入口）。
+- **值得参考**：Transformers 的 RMSNorm/RoPE/MLP 算子可直接照搬（lake 选 Python+Triton，CPU 路径用纯 torch SDPA 已就位）；vLLM dummy run 复用生产入口的形态。
+- **关键差异**：Transformers KV 经 `past_key_values` 贯穿模型 API，lake KV 归池、模型 forward 只吃 `input_ids`/`positions`（C16a 非分页）或 `AttentionMetadata`+arena（C16b），模型 API 不拥有 KV 生命周期；vLLM HBM 引擎自分配，lake arena 归池（C16b）。
+
+
 
 > **不进 protobuf**（边6 = PyO3 / `.so`）。Python 落点：`lake/engine/agent.py::StorageAgent` + `lake/engine/pool_types.py`；P3 实现 `lake/engine/agents/grpc_skeleton.py`；单测 `lake/engine/agents/memory.py`。
 

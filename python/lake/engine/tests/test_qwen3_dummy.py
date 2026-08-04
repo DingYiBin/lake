@@ -74,8 +74,10 @@ def test_qwen3_load_weights_keeps_model_api_plain() -> None:
     assert len(model.model.layers) == QWEN3_0_6B_CONFIG.num_hidden_layers
     assert model.model.layers[0].layer_idx == 0
     assert model.lm_head is model.model.embed_tokens
-    assert model.forward([1, 2], [0, 1]) == [1, 2]
-    assert model.compute_logits("hidden") == "hidden"
+    # C16a：forward/compute_logits 现为真实计算（需物化权重）；未物化时 meta 权重不可 forward，
+    # 故此处只验 API 边界，真实 forward 由 materialize 后的用例覆盖。
+    assert callable(model.forward)
+    assert callable(model.compute_logits)
     loaded = model.load_weights([("model.norm.weight", object())])
     assert model.loaded_dummy_weights is False
     assert loaded == {"model.norm.weight"}
@@ -244,3 +246,69 @@ def test_qwen3_dummy_decode_uses_sampling_bitmask() -> None:
     out = runner.execute_model(output, ready, {req.req_id: req})
     assert out.next_token_ids == {req.req_id: [forced_token]}
     assert ag.done_calls == 0
+
+
+def _tiny_qwen3_config() -> Qwen3Config:
+    return Qwen3Config(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        intermediate_size=64,
+        rms_norm_eps=1e-6,
+        max_position_embeddings=128,
+        tie_word_embeddings=False,
+        rope_theta=10000.0,
+        architectures=["Qwen3ForCausalLM"],
+    )
+
+
+def test_qwen3_materialize_and_forward_produces_finite_logits() -> None:
+    """C16a：物化 meta 权重后真实 forward 产有限 logits。"""
+    from lake.engine.model_executor.layers.attentions import build_attn_backend
+    from lake.engine.model_executor.models.loader import materialize_model
+
+    model = Qwen3ForCausalLM(_tiny_qwen3_config(), attn_backend=build_attn_backend("cpu"))
+    materialize_model(model, device="cpu", dtype=torch.float32)
+    input_ids = torch.tensor([1, 2, 3, 4], dtype=torch.long)
+    positions = torch.arange(4, dtype=torch.long)
+    with torch.no_grad():
+        hidden = model.forward(input_ids, positions)
+        logits = model.compute_logits(hidden)
+    assert hidden.shape == (4, 32)
+    assert logits.shape == (4, 64)
+    assert torch.isfinite(logits).all()
+
+
+def test_qwen3_forward_argmax_in_vocab_range() -> None:
+    """C16a：真实 forward 末位 logits 的 argmax 落在 vocab 内且确定性。"""
+    from lake.engine.model_executor.layers.attentions import build_attn_backend
+    from lake.engine.model_executor.models.loader import materialize_model
+
+    cfg = _tiny_qwen3_config()
+    model = Qwen3ForCausalLM(cfg, attn_backend=build_attn_backend("cpu"))
+    materialize_model(model, device="cpu", dtype=torch.float32, seed=1)
+    input_ids = torch.tensor([5, 6, 7], dtype=torch.long)
+    positions = torch.arange(3, dtype=torch.long)
+    with torch.no_grad():
+        logits = model.compute_logits(model.forward(input_ids, positions))
+    tok = int(torch.argmax(logits[-1]).item())
+    assert 0 <= tok < cfg.vocab_size
+    # 同输入再跑一次，确定性
+    with torch.no_grad():
+        logits2 = model.compute_logits(model.forward(input_ids, positions))
+    assert int(torch.argmax(logits2[-1]).item()) == tok
+
+
+def test_runner_dummy_run_produces_real_forward_tokens() -> None:
+    """C16a：runner dummy_run 经真实 forward 产 in-range token。"""
+    ag = InMemoryAgent()
+    pool = PoolIface(ag)
+    runner = ModelRunner(pool)
+    runner.load_model(model_path=QWEN3_0_6B_MODEL_ID)
+    out = runner.dummy_run(num_reqs=1, tokens_per_req=4, step_id=0)
+    assert len(out.next_token_ids) == 1
+    tok = next(iter(out.next_token_ids.values()))[0]
+    assert 0 <= tok < QWEN3_0_6B_CONFIG.vocab_size
