@@ -105,19 +105,18 @@ class InputBuffers:
         self.device = torch.device(device)
         self._use_staging = self.device.type == "cuda"
 
-        def _dev(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
-            return torch.zeros(shape, dtype=dtype, device=self.device)
-
-        self.input_ids = _dev((max_num_tokens,), torch.int32)
-        self.positions = _dev((max_num_tokens,), torch.int64)
+        self.input_ids = torch.zeros(max_num_tokens, dtype=torch.int32, device=self.device)
+        self.positions = torch.zeros(max_num_tokens, dtype=torch.int64, device=self.device)
         self.is_padding = torch.ones(max_num_tokens, dtype=torch.bool, device=self.device)
-        self.query_start_loc = _dev((max_num_reqs + 1,), torch.int32)
-        self.seq_lens = _dev((max_num_reqs,), torch.int32)
+        self.query_start_loc = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=self.device)
+        self.seq_lens = torch.zeros(max_num_reqs, dtype=torch.int32, device=self.device)
         self.slot_mapping = torch.full(
             (max_num_tokens,), -1, dtype=torch.int32, device=self.device
         )
-        self.block_table = _dev((max_num_reqs, max_num_blocks), torch.int32)
-        self.block_table_lens = _dev((max_num_reqs,), torch.int32)
+        self.block_table = torch.zeros(
+            max_num_reqs, max_num_blocks, dtype=torch.int32, device=self.device
+        )
+        self.block_table_lens = torch.zeros(max_num_reqs, dtype=torch.int32, device=self.device)
 
         self._stage: Optional[dict[str, torch.Tensor]] = None
         if self._use_staging:
