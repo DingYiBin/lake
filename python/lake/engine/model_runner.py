@@ -18,6 +18,7 @@ from lake.engine.model_executor.layers.attentions import (
     build_attn_backend,
     build_attn_metadata,
 )
+from lake.engine.model_executor.layers.attentions.context import forward_context
 from lake.engine.input_batch import InputBatch, InputBuffers
 from lake.engine.model_executor.models.loader import materialize_model
 from lake.engine.model_executor.models.registry import load_registered_model
@@ -184,7 +185,8 @@ class ModelRunner:
 
         生产由存储池放置 HBM（方案 Z）；dummy/test 路径由 runner 持 mock 句柄。
         ``total_slots = max_num_blocks * block_size`` 覆盖 block_table 引用的全部 block。
-        非 Qwen3 结构（自定义/测试桩无 ``model.layers``）返回空列表 → 走 C16a 回退。
+        非 Qwen3 结构（自定义/测试桩无 ``model.layers``）返回空列表；此时
+        paged forward 会显式失败，调用方必须提供可分页执行的数据路径。
         """
         assert self._model is not None
         model = getattr(self._model, "model", None)
@@ -388,21 +390,23 @@ class ModelRunner:
         本步所有 query token 拼成 flat ``input_ids``（来自 ``InputBuffers``，仅本步
         新算 token，非全上下文），经模型 forward：每层 attention 把新 k/v 按
         ``slot_mapping`` 写入 mock KV arena、``forward_varlen`` 读 paged 前缀 KV。
-        取每请求末位 query token 的 logits 采样。非 prompt-phase 跳过采样（与 C16a
-        一致：prefill 首 token 由后续 decode 产出）。无 KV arena 时回退到 C16a 逐请求
-        非分页路径。
+        取每请求末位 query token 的 logits 采样。非 prompt-phase 跳过采样（prefill
+        首 token 由后续 decode 产出）。runner 只消费已 ready 的 paged 数据；缺
+        metadata / KV arena / block table 是准备阶段错误。
         """
         assert self._model is not None
         meta = self._attn_meta
-        # paged 路径需 agent 出 block table；未出（测试桩 / 无 arena）回退 C16a 逐请求。
-        if meta is None or not self._kv_caches or not meta.block_tables:
-            return self._forward_model_per_req(output, host_reqs, batch)
+        if meta is None:
+            raise RuntimeError("attention metadata must be prepared before forward")
+        if not self._kv_caches:
+            raise RuntimeError("paged KV arena must be allocated before forward")
+        if not meta.block_tables:
+            raise RuntimeError("block tables must be ready before forward")
 
         buffers = self._input_buffers
         nt = buffers.effective_num_tokens
         input_ids = buffers.input_ids[:nt].to(torch.long)
         positions = buffers.positions[:nt].to(torch.long)
-        from lake.engine.model_executor.layers.attentions.context import forward_context
         with forward_context(meta, self._kv_caches):
             with torch.no_grad():
                 hidden = self._model.forward(input_ids, positions)
@@ -417,32 +421,6 @@ class ModelRunner:
             if last_idx < 0:
                 continue
             last_logits[req_id] = logits[last_idx].to(torch.float32).tolist()
-        return self.sample_tokens(output, host_reqs, last_logits)
-
-    def _forward_model_per_req(
-        self,
-        output: SchedulerOutput,
-        host_reqs: Mapping[str, Req],
-        batch: InputBatch,
-    ) -> Tuple[Dict[str, List[int]], Dict[str, List[int]]]:
-        """C16a 逐请求非分页 forward（无 KV arena 时的回退路径）。"""
-        assert self._model is not None
-        last_logits: Dict[str, List[float]] = {}
-        for row, req_id in enumerate(batch.req_ids):
-            if batch.is_prompt_phase[row]:
-                continue
-            req = host_reqs.get(req_id)
-            if req is None:
-                continue
-            ctx = list(req.all_token_ids)
-            if not ctx:
-                continue
-            input_ids = torch.tensor(ctx, dtype=torch.long)
-            positions = torch.arange(len(ctx), dtype=torch.long)
-            with torch.no_grad():
-                hidden = self._model.forward(input_ids, positions)
-                logits = self._model.compute_logits(hidden)  # [T, vocab]
-            last_logits[req_id] = logits[-1].to(torch.float32).tolist()
         return self.sample_tokens(output, host_reqs, last_logits)
 
     def clear_drafter(self, req_id: str) -> None:

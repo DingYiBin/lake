@@ -21,6 +21,7 @@ from transformers import Qwen3Config
 
 from lake.engine.config.parallel import ParallelConfig
 from lake.engine.distributed.parallel_state import tp_group_for_config
+from lake.engine.model_executor.layers.attentions.context import get_forward_context
 from lake.engine.model_executor.layers.linear import (
     ColumnParallelLinearLayer,
     MergedColumnParallelLinearLayer,
@@ -280,7 +281,6 @@ class Qwen3Attention(nn.Module):
         k = self.k_norm(k)
         q, k = self.rotary_emb(positions, q, k)
 
-        from lake.engine.model_executor.layers.attentions.context import get_forward_context
         ctx = get_forward_context()
         if (
             ctx is not None
