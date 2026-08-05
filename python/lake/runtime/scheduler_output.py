@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional
 
+TOP_K_ALL = 1 << 30
+
 
 class ForwardMode(str, Enum):
     """由本步 token 几何派生的批标签（非 SGLang 式执行态）。"""
@@ -32,8 +34,9 @@ class ForwardMode(str, Enum):
 class SamplingParams:
     max_new_tokens: int = 16
     temperature: float = 1.0
-    top_k: int = -1
+    top_k: int = TOP_K_ALL
     top_p: float = 1.0
+    sampling_seed: Optional[int] = None
     structured_output: Optional[str] = None
     # 首版仅占位；完整对照见 docs/research/sampling-params.md
 

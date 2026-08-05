@@ -335,6 +335,8 @@ class ModelRunner:
         temperatures: List[float] = []
         top_ks: List[int] = []
         top_ps: List[float] = []
+        sampling_seeds: List[int | None] = []
+        positions: List[int] = []
         cum_num_sampling_tokens = [0]
         for req_id, logits in last_logits.items():
             if req_id in deferred:
@@ -350,13 +352,19 @@ class ModelRunner:
             temperatures.append(req.sampling_params.temperature)
             top_ks.append(req.sampling_params.top_k)
             top_ps.append(req.sampling_params.top_p)
+            sampling_seeds.append(req.sampling_params.sampling_seed)
+            position = output.req_query_end.get(req_id, len(req.all_token_ids)) - 1
+            positions.append(max(0, position))
             cum_num_sampling_tokens.append(cum_num_sampling_tokens[-1] + 1)
         if sample_logits:
+            seeded = any(s is not None for s in sampling_seeds)
             metadata = SamplingMetadata.from_lists(
                 temperatures=temperatures,
                 top_ks=top_ks,
                 top_ps=top_ps,
                 cum_num_sampling_tokens=cum_num_sampling_tokens,
+                sampling_seeds=sampling_seeds if seeded else None,
+                positions=positions,
             )
             logits_tensor = torch.tensor(sample_logits, dtype=torch.float32)
             sampled = self._sampler(logits_tensor, metadata)
