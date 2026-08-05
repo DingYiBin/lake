@@ -24,8 +24,8 @@ from lake.engine.model_executor.models.loader import materialize_model
 from lake.engine.model_executor.models.registry import load_registered_model
 from lake.engine.pool_iface import PoolIface
 from lake.engine.pool_types import ReadyHandle
-from lake.engine.sample.greedy import greedy_sample
 from lake.engine.sample.grammar import apply_token_bitmask
+from lake.engine.sample.sampler import Sampler, SamplingMetadata
 from lake.runtime.req import Req
 from lake.runtime.scheduler_output import ForwardMode, SamplingParams, SchedulerOutput
 
@@ -85,6 +85,7 @@ class ModelRunner:
         # 构造期注入到每个 ``Qwen3PagedAttention``——模型层不 import 任何具体后端
         # （对齐 vLLM ``Attention``/SGLang ``RadixAttention``：后端由 runner 选定注入）。
         self._attn_backend = build_attn_backend(role.attn_backend_name)
+        self._sampler = Sampler()
         self._config_override = model_config
         self._model: Optional[Any] = None
         self._architecture = ""
@@ -329,6 +330,12 @@ class ModelRunner:
         grammar = output.grammar_output
         deferred = set(grammar.deferred_req_ids if grammar is not None else [])
         bitmasks = grammar.token_bitmask_by_req if grammar is not None else {}
+        sample_req_ids: List[str] = []
+        sample_logits: List[List[float]] = []
+        temperatures: List[float] = []
+        top_ks: List[int] = []
+        top_ps: List[float] = []
+        cum_num_sampling_tokens = [0]
         for req_id, logits in last_logits.items():
             if req_id in deferred:
                 continue
@@ -338,7 +345,23 @@ class ModelRunner:
             masked_logits = logits
             if req_id in bitmasks:
                 masked_logits = apply_token_bitmask(logits, bitmasks[req_id])
-            out[req_id] = [greedy_sample(masked_logits)]
+            sample_req_ids.append(req_id)
+            sample_logits.append(masked_logits)
+            temperatures.append(req.sampling_params.temperature)
+            top_ks.append(req.sampling_params.top_k)
+            top_ps.append(req.sampling_params.top_p)
+            cum_num_sampling_tokens.append(cum_num_sampling_tokens[-1] + 1)
+        if sample_logits:
+            metadata = SamplingMetadata.from_lists(
+                temperatures=temperatures,
+                top_ks=top_ks,
+                top_ps=top_ps,
+                cum_num_sampling_tokens=cum_num_sampling_tokens,
+            )
+            logits_tensor = torch.tensor(sample_logits, dtype=torch.float32)
+            sampled = self._sampler(logits_tensor, metadata)
+            for req_id, token_id in zip(sample_req_ids, sampled.tolist()):
+                out[req_id] = [int(token_id)]
         return out, drafts_out
 
     def execute_model(

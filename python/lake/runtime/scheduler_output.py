@@ -32,6 +32,8 @@ class ForwardMode(str, Enum):
 class SamplingParams:
     max_new_tokens: int = 16
     temperature: float = 1.0
+    top_k: int = -1
+    top_p: float = 1.0
     structured_output: Optional[str] = None
     # 首版仅占位；完整对照见 docs/research/sampling-params.md
 
