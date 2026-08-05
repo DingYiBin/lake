@@ -21,15 +21,13 @@ _GREEDY_EPS = 1e-6
 class SamplingMetadata:
     """Batched sampling parameters.
 
-    ``cum_num_sampling_tokens`` has length ``num_reqs + 1``. The range
-    ``[cum[i], cum[i + 1])`` maps logits rows to request ``i`` and reuses that
-    request's temperature / top-k / top-p parameters.
+    Each logits row maps to one request and uses the parameter value at the same
+    row index.
     """
 
     temperatures: torch.Tensor
     top_ks: torch.Tensor
     top_ps: torch.Tensor
-    cum_num_sampling_tokens: torch.Tensor
     sampling_seeds: torch.Tensor | None = None
     positions: torch.Tensor | None = None
     all_greedy: bool = False
@@ -42,7 +40,6 @@ class SamplingMetadata:
         temperatures: Sequence[float],
         top_ks: Sequence[int],
         top_ps: Sequence[float],
-        cum_num_sampling_tokens: Sequence[int],
         sampling_seeds: Sequence[int | None] | None = None,
         positions: Sequence[int] | None = None,
         device: torch.device | str | None = None,
@@ -50,7 +47,6 @@ class SamplingMetadata:
         all_random: bool | None = None,
     ) -> "SamplingMetadata":
         temps = list(temperatures)
-        cum = list(cum_num_sampling_tokens)
         seed_tensor = None
         if sampling_seeds is not None:
             seed_tensor = torch.tensor(
@@ -62,7 +58,7 @@ class SamplingMetadata:
         if positions is not None:
             pos_tensor = torch.tensor(positions, dtype=torch.int64, device=device)
         elif seed_tensor is not None:
-            pos_tensor = torch.arange(cum[-1], dtype=torch.int64, device=device)
+            pos_tensor = torch.arange(len(temps), dtype=torch.int64, device=device)
         if all_greedy is None:
             all_greedy = all(t <= _GREEDY_EPS for t in temps)
         if all_random is None:
@@ -71,9 +67,6 @@ class SamplingMetadata:
             temperatures=torch.tensor(temps, dtype=torch.float32, device=device),
             top_ks=torch.tensor(top_ks, dtype=torch.int32, device=device),
             top_ps=torch.tensor(top_ps, dtype=torch.float32, device=device),
-            cum_num_sampling_tokens=torch.tensor(
-                cum, dtype=torch.int32, device=device
-            ),
             sampling_seeds=seed_tensor,
             positions=pos_tensor,
             all_greedy=all_greedy,
@@ -82,7 +75,7 @@ class SamplingMetadata:
 
     @property
     def num_reqs(self) -> int:
-        return int(self.cum_num_sampling_tokens.numel() - 1)
+        return int(self.temperatures.numel())
 
 
 class Sampler(nn.Module):
@@ -93,15 +86,15 @@ class Sampler(nn.Module):
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> torch.Tensor:
-        """Sample token ids from ``[num_sampling_tokens, vocab]`` logits.
-
-        Per-request parameters are broadcast over row ranges described by
-        ``sampling_metadata.cum_num_sampling_tokens``.
-        """
+        """Sample token ids from ``[num_reqs, vocab]`` logits."""
 
         scores = logits.to(dtype=torch.float32)
-
-        temperatures, top_ks, top_ps = _expand_params(scores, sampling_metadata)
+        temperatures = sampling_metadata.temperatures.to(
+            device=scores.device,
+            dtype=torch.float32,
+        )
+        top_ks = sampling_metadata.top_ks.to(device=scores.device, dtype=torch.long)
+        top_ps = sampling_metadata.top_ps.to(device=scores.device, dtype=torch.float32)
 
         if sampling_metadata.all_greedy:
             return torch.argmax(scores, dim=-1)
@@ -118,7 +111,10 @@ class Sampler(nn.Module):
         if sampling_metadata.sampling_seeds is None:
             random_sampled = torch.multinomial(probs, num_samples=1).squeeze(-1)
         else:
-            seeds = _expand_sampling_seeds(scores, sampling_metadata)
+            seeds = sampling_metadata.sampling_seeds.to(
+                device=scores.device,
+                dtype=torch.long,
+            )
             positions = sampling_metadata.positions.to(
                 device=scores.device,
                 dtype=torch.long,
@@ -130,42 +126,6 @@ class Sampler(nn.Module):
 
         greedy_sampled = torch.argmax(scores, dim=-1)
         return torch.where(temperatures <= _GREEDY_EPS, greedy_sampled, random_sampled)
-
-
-def _expand_params(
-    scores: torch.Tensor,
-    sampling_metadata: SamplingMetadata,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    cum = sampling_metadata.cum_num_sampling_tokens.to(
-        device=scores.device,
-        dtype=torch.long,
-    )
-    counts = cum[1:] - cum[:-1]
-    output_size = scores.shape[0]
-    temperatures = sampling_metadata.temperatures.to(
-        device=scores.device, dtype=torch.float32
-    ).repeat_interleave(counts, output_size=output_size)
-    top_ks = sampling_metadata.top_ks.to(
-        device=scores.device, dtype=torch.long
-    ).repeat_interleave(counts, output_size=output_size)
-    top_ps = sampling_metadata.top_ps.to(
-        device=scores.device, dtype=torch.float32
-    ).repeat_interleave(counts, output_size=output_size)
-    return temperatures, top_ks, top_ps
-
-
-def _expand_sampling_seeds(
-    scores: torch.Tensor,
-    sampling_metadata: SamplingMetadata,
-) -> torch.Tensor:
-    cum = sampling_metadata.cum_num_sampling_tokens.to(
-        device=scores.device,
-        dtype=torch.long,
-    )
-    counts = cum[1:] - cum[:-1]
-    return sampling_metadata.sampling_seeds.to(
-        device=scores.device, dtype=torch.long
-    ).repeat_interleave(counts, output_size=scores.shape[0])
 
 
 def _apply_top_k(scores: torch.Tensor, top_ks: torch.Tensor) -> torch.Tensor:

@@ -34,7 +34,6 @@ def test_sampler_greedy_temperature_zero() -> None:
         temperatures=[0.0],
         top_ks=[TOP_K_ALL],
         top_ps=[1.0],
-        cum_num_sampling_tokens=[0, 1],
     )
     logits = torch.tensor([[0.1, 0.9, 0.2]], dtype=torch.float32)
     assert Sampler()(logits, metadata).tolist() == [1]
@@ -45,7 +44,6 @@ def test_sampler_top_k_one() -> None:
         temperatures=[1.0],
         top_ks=[1],
         top_ps=[1.0],
-        cum_num_sampling_tokens=[0, 1],
     )
     logits = torch.tensor([[0.1, 0.9, 0.2]], dtype=torch.float32)
     assert Sampler()(logits, metadata).tolist() == [1]
@@ -56,18 +54,16 @@ def test_sampler_top_p_keeps_min_prefix() -> None:
         temperatures=[1.0],
         top_ks=[TOP_K_ALL],
         top_ps=[0.5],
-        cum_num_sampling_tokens=[0, 1],
     )
     logits = torch.tensor([[10.0, 9.0, 0.0]], dtype=torch.float32)
     assert Sampler()(logits, metadata).tolist() == [0]
 
 
-def test_sampler_broadcasts_params_by_cum_range() -> None:
+def test_sampler_uses_params_by_row() -> None:
     metadata = SamplingMetadata.from_lists(
         temperatures=[0.0, 1.0],
         top_ks=[TOP_K_ALL, 1],
         top_ps=[1.0, 1.0],
-        cum_num_sampling_tokens=[0, 1, 2],
     )
     logits = torch.tensor([
         [0.1, 0.9, 0.2],
@@ -78,11 +74,10 @@ def test_sampler_broadcasts_params_by_cum_range() -> None:
 
 def test_sampler_seeded_sampling_is_deterministic() -> None:
     metadata = SamplingMetadata.from_lists(
-        temperatures=[1.0],
-        top_ks=[TOP_K_ALL],
-        top_ps=[1.0],
-        cum_num_sampling_tokens=[0, 2],
-        sampling_seeds=[1234],
+        temperatures=[1.0, 1.0],
+        top_ks=[TOP_K_ALL, TOP_K_ALL],
+        top_ps=[1.0, 1.0],
+        sampling_seeds=[1234, 1234],
         positions=[7, 8],
     )
     logits = torch.zeros((2, 8), dtype=torch.float32)
