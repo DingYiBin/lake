@@ -8,12 +8,14 @@ from lake.engine.agents.memory import InMemoryAgent
 from lake.engine.pool_iface import PoolIface
 from lake.engine.sample.grammar import apply_token_bitmask
 from lake.engine.sample.greedy import greedy_sample
+from lake.engine.sample.reject import RejectionSampler, SpeculativeMetadata
 from lake.engine.sample.sampler import Sampler, SamplingMetadata
 from lake.runtime.req import Req
 from lake.runtime.scheduler_output import (
     ForwardMode,
     GrammarOutput,
     SamplingParams,
+    SpeculativeParameters,
     SchedulerOutput,
     TOP_K_ALL,
 )
@@ -65,10 +67,13 @@ def test_sampler_uses_params_by_row() -> None:
         top_ks=[TOP_K_ALL, 1],
         top_ps=[1.0, 1.0],
     )
-    logits = torch.tensor([
-        [0.1, 0.9, 0.2],
-        [0.3, 0.2, 0.8],
-    ], dtype=torch.float32)
+    logits = torch.tensor(
+        [
+            [0.1, 0.9, 0.2],
+            [0.3, 0.2, 0.8],
+        ],
+        dtype=torch.float32,
+    )
     assert Sampler()(logits, metadata).tolist() == [1, 2]
 
 
@@ -86,6 +91,90 @@ def test_sampler_seeded_sampling_is_deterministic() -> None:
     second = Sampler()(logits, metadata)
 
     assert first.tolist() == second.tolist()
+
+
+def test_rejection_sampler_accepts_all_drafts_and_bonus() -> None:
+    sampler = RejectionSampler(SpeculativeParameters(num_speculative_tokens=2))
+    target_probs = torch.tensor(
+        [
+            [
+                [0.1, 0.8, 0.1, 0.0],
+                [0.1, 0.1, 0.8, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    draft_probs = torch.tensor(
+        [
+            [
+                [0.1, 0.8, 0.1, 0.0],
+                [0.1, 0.1, 0.8, 0.0],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+
+    out = sampler(
+        _probs_to_logits(target_probs),
+        SpeculativeMetadata(
+            draft_token_ids=torch.tensor([[1, 2]], dtype=torch.long),
+            draft_probs=draft_probs,
+            uniform_samples=torch.zeros((1, 2), dtype=torch.float32),
+            uniform_samples_for_final=torch.tensor([0.5], dtype=torch.float32),
+        ),
+        SamplingMetadata.from_lists(
+            temperatures=[1.0],
+            top_ks=[TOP_K_ALL],
+            top_ps=[1.0],
+        ),
+    )
+
+    assert out.token_ids.tolist() == [[1, 2, 3]]
+    assert out.num_accepted.tolist() == [2]
+    assert out.num_sampled.tolist() == [3]
+
+
+def test_rejection_sampler_samples_residual_on_reject() -> None:
+    sampler = RejectionSampler(SpeculativeParameters(num_speculative_tokens=2))
+    target_probs = torch.tensor(
+        [
+            [
+                [0.2, 0.7, 0.1],
+                [0.1, 0.8, 0.1],
+                [0.1, 0.1, 0.8],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    draft_probs = torch.tensor(
+        [
+            [
+                [0.8, 0.1, 0.1],
+                [0.1, 0.8, 0.1],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+
+    out = sampler(
+        _probs_to_logits(target_probs),
+        SpeculativeMetadata(
+            draft_token_ids=torch.tensor([[0, 1]], dtype=torch.long),
+            draft_probs=draft_probs,
+            uniform_samples=torch.tensor([[0.5, 0.0]], dtype=torch.float32),
+            uniform_samples_for_final=torch.tensor([0.5], dtype=torch.float32),
+        ),
+        SamplingMetadata.from_lists(
+            temperatures=[1.0],
+            top_ks=[TOP_K_ALL],
+            top_ps=[1.0],
+        ),
+    )
+
+    assert out.token_ids.tolist() == [[1, -1, -1]]
+    assert out.num_accepted.tolist() == [0]
+    assert out.num_sampled.tolist() == [1]
 
 
 def test_sample_tokens_uses_grammar_bitmask() -> None:
@@ -145,3 +234,7 @@ def test_sample_tokens_can_defer_structured_output() -> None:
     )
     sampled, _ = runner.sample_tokens(output, {"g2": req}, {"g2": [0.1, 0.9, 0.2]})
     assert sampled == {}
+
+
+def _probs_to_logits(probs: torch.Tensor) -> torch.Tensor:
+    return torch.log(torch.clamp(probs, min=torch.finfo(probs.dtype).tiny))

@@ -42,6 +42,11 @@ class SamplingParams:
 
 
 @dataclass
+class SpeculativeParameters:
+    num_speculative_tokens: int = 0
+
+
+@dataclass
 class NewRequestData:
     req_id: str
     prompt_token_ids: List[int]

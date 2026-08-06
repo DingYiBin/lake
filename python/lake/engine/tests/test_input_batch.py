@@ -52,6 +52,37 @@ def test_prepare_inputs_attn_metadata() -> None:
     assert meta.block_table_tensor[0, :2].tolist() == [0, 1]
 
 
+def test_input_buffers_allocate_draft_state() -> None:
+    buffers = InputBuffers(
+        max_num_reqs=3,
+        max_num_tokens=8,
+        max_num_draft_tokens=2,
+        max_num_mtp_layers=3,
+        vocab_size=5,
+        hidden_size=4,
+    )
+
+    assert buffers.draft.enabled is True
+    assert buffers.draft.max_num_mtp_layers == 3
+    assert tuple(buffers.draft.draft_token_ids.shape) == (3, 2)
+    assert tuple(buffers.draft.draft_probs.shape) == (3, 2, 5)
+    assert tuple(buffers.draft.hidden_states.shape) == (3, 3, 4)
+
+    buffers.draft.num_draft_tokens[0] = 2
+    buffers.draft.draft_token_ids[0, 0] = 7
+    buffers.draft.bonus_token_ids[0] = 9
+    buffers.draft.draft_probs[0, 0, 1] = 1.0
+    buffers.draft.hidden_states[0, 0, 2] = 1.0
+
+    buffers.clear()
+
+    assert buffers.draft.num_draft_tokens.tolist() == [0, 0, 0]
+    assert buffers.draft.draft_token_ids.tolist() == [[-1, -1], [-1, -1], [-1, -1]]
+    assert buffers.draft.bonus_token_ids.tolist() == [-1, -1, -1]
+    assert buffers.draft.draft_probs.sum().item() == 0.0
+    assert buffers.draft.hidden_states.sum().item() == 0.0
+
+
 def test_decode_slot_mapping_matches_query_position() -> None:
     pool = PoolIface(InMemoryAgent())
     runner = make_runner(pool, load=False)

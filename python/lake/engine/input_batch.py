@@ -72,6 +72,99 @@ class InputBatch:
         return self.req_ids.index(req_id)
 
 
+class DraftInputBuffers:
+    """Draft/spec side per-request state owned by ``InputBuffers``.
+
+    The base buffers describe the target forward geometry. This companion keeps
+    draft tokens/probs and optional hidden states row-aligned with ``req_ids`` so
+    later MTP/EAGLE paths do not scatter request-local spec state across helpers.
+    """
+
+    def __init__(
+        self,
+        max_num_reqs: int,
+        max_num_draft_tokens: int,
+        *,
+        device: DeviceLike = "cpu",
+        vocab_size: int | None = None,
+        hidden_size: int | None = None,
+        max_num_mtp_layers: int | None = None,
+        hidden_dtype: torch.dtype = torch.float32,
+    ) -> None:
+        if max_num_draft_tokens < 0:
+            raise ValueError("max_num_draft_tokens must be >= 0")
+        if max_num_mtp_layers is not None and max_num_mtp_layers < 0:
+            raise ValueError("max_num_mtp_layers must be >= 0")
+        if vocab_size is not None and vocab_size <= 0:
+            raise ValueError("vocab_size must be > 0 when provided")
+        if hidden_size is not None and hidden_size <= 0:
+            raise ValueError("hidden_size must be > 0 when provided")
+
+        self.max_num_reqs = max_num_reqs
+        self.max_num_draft_tokens = max_num_draft_tokens
+        self.max_num_mtp_layers = (
+            max_num_draft_tokens
+            if max_num_mtp_layers is None
+            else max_num_mtp_layers
+        )
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self.device = torch.device(device)
+
+        self.num_draft_tokens = torch.zeros(
+            max_num_reqs,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.draft_token_ids = torch.full(
+            (max_num_reqs, max_num_draft_tokens),
+            -1,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self.bonus_token_ids = torch.full(
+            (max_num_reqs,),
+            -1,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self.draft_probs = (
+            torch.zeros(
+                max_num_reqs,
+                max_num_draft_tokens,
+                vocab_size,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            if vocab_size is not None and max_num_draft_tokens > 0
+            else None
+        )
+        self.hidden_states = (
+            torch.zeros(
+                max_num_reqs,
+                self.max_num_mtp_layers,
+                hidden_size,
+                dtype=hidden_dtype,
+                device=self.device,
+            )
+            if hidden_size is not None and self.max_num_mtp_layers > 0
+            else None
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return self.max_num_draft_tokens > 0
+
+    def clear(self) -> None:
+        self.num_draft_tokens.zero_()
+        self.draft_token_ids.fill_(-1)
+        self.bonus_token_ids.fill_(-1)
+        if self.draft_probs is not None:
+            self.draft_probs.zero_()
+        if self.hidden_states is not None:
+            self.hidden_states.zero_()
+
+
 class InputBuffers:
     """固定地址执行 buffer（对齐 vLLM V2 ``InputBuffers``）。
 
@@ -87,6 +180,11 @@ class InputBuffers:
         device: DeviceLike = "cpu",
         max_num_blocks: int = 256,
         block_size: int = 8,
+        max_num_draft_tokens: int = 0,
+        max_num_mtp_layers: int | None = None,
+        vocab_size: int | None = None,
+        hidden_size: int | None = None,
+        hidden_dtype: torch.dtype = torch.float32,
     ) -> None:
         if max_num_reqs <= 0:
             raise ValueError("max_num_reqs must be > 0")
@@ -104,6 +202,15 @@ class InputBuffers:
         self.block_size = block_size
         self.device = torch.device(device)
         self._use_staging = self.device.type == "cuda"
+        self.draft = DraftInputBuffers(
+            max_num_reqs=max_num_reqs,
+            max_num_draft_tokens=max_num_draft_tokens,
+            device=self.device,
+            vocab_size=vocab_size,
+            hidden_size=hidden_size,
+            max_num_mtp_layers=max_num_mtp_layers,
+            hidden_dtype=hidden_dtype,
+        )
 
         self.input_ids = torch.zeros(max_num_tokens, dtype=torch.int32, device=self.device)
         self.positions = torch.zeros(max_num_tokens, dtype=torch.int64, device=self.device)
@@ -205,6 +312,7 @@ class InputBuffers:
         tgt_slot.fill_(-1)
         tgt_bt.zero_()
         tgt_btl.zero_()
+        self.draft.clear()
 
     def _flush_staging(self) -> None:
         if self._stage is None:
